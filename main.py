@@ -13,7 +13,15 @@ from datetime import datetime, timezone
 # Añadir raíz al path
 sys.path.insert(0, os.path.dirname(__file__))
 
+# ── INICIALIZAR BASE DE DATOS PRIMERO ─────────────────────────────
+# Esto debe ir ANTES de importar cualquier módulo que use la BD
 from core.database import init_db, get_config, log_event, record_capital
+
+# Inicializar la base de datos inmediatamente
+init_db()
+print("✅ Base de datos lista")
+
+# ── AHORA importar los demás módulos ─────────────────────────────
 from core.binance_futures import binance
 from core.executor import executor
 from dashboard.dashboard import run_dashboard
@@ -91,11 +99,7 @@ def main():
     print("  Estrategia D: Log+EMA · ACP · Macro · RR 3:1")
     print("=" * 55)
 
-    # 1. Inicializar base de datos
-    init_db()
-    print("✅ Base de datos lista")
-
-    # 2. Verificar conexión Binance (no bloquear si falla)
+    # 1. Verificar conexión Binance (no bloquear si falla)
     testnet = get_config("testnet", "true")
     print(f"🔗 Conectando a Binance {'TESTNET' if testnet == 'true' else 'PRODUCCIÓN'}...")
     if binance.ping():
@@ -105,12 +109,12 @@ def main():
         print("⚠️  Sin conexión a Binance (configura API keys en el dashboard)")
         log_event("STARTUP", "Bot iniciado sin conexión Binance — API keys pendientes", "WARNING")
 
-    # 3. Arrancar scheduler en hilo daemon
+    # 2. Arrancar scheduler en hilo daemon
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     print("✅ Scheduler activo — ciclo cada hora en :01")
 
-    # 4. Arrancar dashboard Flask (bloquea el hilo principal)
+    # 3. Arrancar dashboard Flask (bloquea el hilo principal)
     print("✅ Dashboard iniciando...")
     print(f"   URL: http://0.0.0.0:{os.getenv('PORT', 5000)}")
     print(f"   Usuario por defecto: admin / satevis2024")
