@@ -16,7 +16,7 @@ satevis_bot/
     └── dashboard.py         ← Flask: portal web con login
 ```
 
---- 
+---
 
 ## Despliegue en Railway
 
