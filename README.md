@@ -49,7 +49,7 @@ Railway → tu proyecto → Add Volume → Mount path: `/app`
 ### 5. Primer acceso
 - URL del dashboard: https://tu-proyecto.railway.app
 - Usuario: `admin`
-- Contraseña: `s*****s****`
+- Contraseña: `satevis2024`
 - **Cambiar contraseña inmediatamente en Configuración**
 
 ---
