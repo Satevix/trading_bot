@@ -10,6 +10,7 @@ from core.database import (
 )
 from core.binance_futures import binance
 from strategy.strategy_d import strategy
+import core.telegram as tg
 
 
 class TradeExecutor:
@@ -59,6 +60,11 @@ class TradeExecutor:
             log_event("SIGNAL", str(signal))
 
             if signal["direction"] == 0:
+                # Notificar señal filtrada (solo si está habilitado en config)
+                try:
+                    tg.notify_signal_filtered(signal)
+                except Exception:
+                    pass
                 return {"action": "hold", "reason": signal["reason"], "signal": signal}
 
             # Señal válida → ejecutar
@@ -134,6 +140,24 @@ class TradeExecutor:
         log_event("TRADE_OPENED",
                   f"#{trade_id} {side} {params['quantity']} BTC @ ${entry_price:.2f} "
                   f"SL=${params['sl_price']:.2f} TP=${params['tp_price']:.2f}")
+
+        # Notificación Telegram (no interrumpe si falla)
+        try:
+            tg.notify_trade_opened({
+                "side":           "LONG" if direction == 1 else "SHORT",
+                "entry_price":    entry_price,
+                "quantity":       params["quantity"],
+                "size_usdt":      params["position_usdt"],
+                "sl_price":       params["sl_price"],
+                "tp_price":       params["tp_price"],
+                "liq_price":      params["liq_price"],
+                "leverage":       lev,
+                "capital_before": balance,
+                "acp_angle":      signal.get("acp_angle", 0),
+                "open_fee":       params["open_fee"],
+            })
+        except Exception:
+            pass
 
         return {
             "action":    "opened",
@@ -226,6 +250,26 @@ class TradeExecutor:
                   f"#{trade_db['id']} cerrado @ ${exit_price:.2f} "
                   f"PnL=${pnl_net:+.2f} ({raw*100:+.2f}%) Razón={reason}")
 
+        # Notificación Telegram
+        try:
+            closed_data = {
+                "side":           trade_db["side"],
+                "entry_price":    float(trade_db["entry_price"]),
+                "exit_price":     exit_price,
+                "pnl_net":        pnl_net,
+                "pnl_pct":        round(raw * 100, 2),
+                "result":         "WIN" if pnl_net > 0 else "LOSS",
+                "close_reason":   reason,
+                "duration_hours": round(duration, 2),
+                "capital_after":  round(balance + pnl_net, 2),
+                "open_fee":       float(trade_db.get("open_fee") or 0),
+                "close_fee":      round(fees, 4),
+                "funding_cost":   0,
+            }
+            tg.notify_trade_closed(closed_data)
+        except Exception:
+            pass
+
         return {
             "action":    "closed",
             "trade_id":  trade_db["id"],
@@ -283,6 +327,30 @@ class TradeExecutor:
             "duration_hours": round(duration, 2),
             "capital_after": round(balance, 2),
         })
+
+        # Notificación Telegram — urgente si fue liquidación
+        try:
+            notif_data = {
+                "side":          trade_db["side"],
+                "entry_price":   float(trade_db["entry_price"]),
+                "exit_price":    round(price, 2),
+                "liq_price":     float(trade_db.get("liq_price") or 0),
+                "pnl_net":       round(pnl_net, 2),
+                "pnl_pct":       round(raw * 100, 2),
+                "result":        result,
+                "close_reason":  reason,
+                "duration_hours": round(duration, 2),
+                "capital_after": round(balance, 2),
+                "open_fee":      float(trade_db.get("open_fee") or 0),
+                "close_fee":     0,
+                "funding_cost":  0,
+            }
+            if was_liquidated:
+                tg.notify_liquidation(notif_data)
+            else:
+                tg.notify_trade_closed(notif_data)
+        except Exception:
+            pass
 
 
 executor = TradeExecutor()

@@ -130,21 +130,26 @@ def init_db():
 
         # ── Configuración por defecto si es primera vez ───────────
         defaults = {
-            "strategy":         "D_LOG_ACP",
-            "symbol":           "BTCUSDT",
-            "leverage":         "3",
-            "risk_pct":         "1.0",
-            "sl_pct":           "1.5",
-            "tp_pct":           "3.0",
-            "acp_threshold":    "0.04735",
-            "sma_log_period":   "288",
-            "ema_period":       "144",
-            "macro_ema":        "200",
-            "capital_initial":  "1000",
-            "bot_status":       "STOPPED",
-            "testnet":          "true",
-            "binance_api_key":  "",
-            "binance_secret":   "",
+            "strategy":                   "D_LOG_ACP",
+            "symbol":                     "BTCUSDT",
+            "leverage":                   "3",
+            "risk_pct":                   "1.0",
+            "sl_pct":                     "1.5",
+            "tp_pct":                     "3.0",
+            "acp_threshold":              "0.04735",
+            "sma_log_period":             "288",
+            "ema_period":                 "144",
+            "macro_ema":                  "200",
+            "capital_initial":            "1000",
+            "bot_status":                 "STOPPED",
+            "testnet":                    "true",
+            "binance_api_key":            "",
+            "binance_secret":             "",
+            # Telegram
+            "telegram_token":             "",
+            "telegram_chat_id":           "",
+            "telegram_notify_filtered":   "false",
+            "telegram_notify_errors":     "true",
         }
         for k, v in defaults.items():
             conn.execute(

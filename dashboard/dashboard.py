@@ -19,6 +19,7 @@ from core.database import (
     change_password, record_capital, init_db
 )
 from core.binance_futures import binance
+import core.telegram as tg
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "satevis_secret_change_me")
@@ -265,6 +266,37 @@ def api_events():
     """Log de eventos del bot."""
     events = get_events(100)
     return jsonify({"ok": True, "events": events})
+
+
+@app.route("/api/telegram/config", methods=["POST"])
+@login_required
+def api_telegram_config():
+    """Guarda config de Telegram y opcionalmente envía mensaje de prueba."""
+    data    = request.get_json()
+    token   = data.get("token", "").strip()
+    chat_id = data.get("chat_id", "").strip()
+    notify_filtered = data.get("notify_filtered", "false")
+    notify_errors   = data.get("notify_errors", "true")
+    do_test = data.get("test", False)
+
+    if token:
+        set_config("telegram_token", token)
+    if chat_id:
+        set_config("telegram_chat_id", chat_id)
+    set_config("telegram_notify_filtered", notify_filtered)
+    set_config("telegram_notify_errors",   notify_errors)
+
+    if do_test:
+        ok = tg.test_connection()
+        if not ok:
+            return jsonify({"ok": False,
+                            "error": "No se pudo enviar el mensaje. "
+                                     "Verifica el token y chat_id."})
+        log_event("TELEGRAM_TEST", f"Prueba exitosa — chat_id={chat_id}")
+        return jsonify({"ok": True, "message": "Mensaje de prueba enviado ✓"})
+
+    log_event("TELEGRAM_CONFIG", "Configuración de Telegram guardada")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/password", methods=["POST"])
@@ -639,6 +671,50 @@ tr:hover td{background:var(--bg2);}
     </div>
     <div style="margin-top:12px"><button class="btn-primary" onclick="changePassword()">Cambiar contraseña</button></div>
     <div id="pw-alert" style="margin-top:10px"></div>
+  </div>
+</div>
+
+<!-- Telegram config (full width below settings grid) -->
+<div class="card">
+  <div class="card-title">🔔 Notificaciones por Telegram</div>
+  <div class="form-grid">
+    <div class="form-group" style="grid-column:1/-1">
+      <label>Bot Token (obtenido de @BotFather)</label>
+      <input type="password" id="tg-token" placeholder="Dejar vacío para mantener actual">
+    </div>
+    <div class="form-group" style="grid-column:1/-1">
+      <label>Chat ID (tu ID personal de Telegram)</label>
+      <input type="text" id="tg-chat-id" placeholder="Ej: 123456789">
+    </div>
+    <div class="form-group">
+      <label>Notificar señales filtradas (verbose)</label>
+      <select id="tg-filtered">
+        <option value="false">No (recomendado)</option>
+        <option value="true">Sí</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Notificar errores críticos</label>
+      <select id="tg-errors">
+        <option value="true">Sí (recomendado)</option>
+        <option value="false">No</option>
+      </select>
+    </div>
+  </div>
+  <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
+    <button class="btn-primary" onclick="saveTelegram(false)">Guardar configuración</button>
+    <button class="btn-sm" onclick="saveTelegram(true)" style="padding:10px 16px;">
+      📨 Guardar y enviar mensaje de prueba
+    </button>
+  </div>
+  <div id="tg-alert" style="margin-top:10px"></div>
+  <div style="margin-top:14px;padding:12px;background:var(--bg2);border-radius:8px;
+    font-size:11px;color:var(--muted);line-height:1.8;">
+    <strong style="color:var(--text)">Cómo configurar en 2 minutos:</strong><br>
+    1. Abre Telegram → busca <code>@BotFather</code> → envía <code>/newbot</code><br>
+    2. Sigue las instrucciones → copia el <strong>token</strong> que te entrega<br>
+    3. Busca <code>@userinfobot</code> en Telegram → envía cualquier mensaje → copia tu <strong>ID</strong><br>
+    4. Pega token e ID aquí → clic en "Guardar y enviar mensaje de prueba"
   </div>
 </div>
 
@@ -1018,7 +1094,8 @@ async function loadConfig() {
   const d = await r.json();
   if (!d.ok) return;
   const cfg = d.config;
-  const skip = ['binance_api_key','binance_secret','bot_status'];
+  const skip = ['binance_api_key','binance_secret','bot_status',
+                'telegram_token','telegram_chat_id'];
   const labels = {
     strategy:'Estrategia', symbol:'Par', leverage:'Apalancamiento',
     risk_pct:'Riesgo por trade (%)', sl_pct:'Stop Loss (%)', tp_pct:'Take Profit (%)',
@@ -1036,6 +1113,16 @@ async function loadConfig() {
   // Prellenar campos editables
   if (cfg.testnet) document.getElementById('cfg-testnet').value = cfg.testnet;
   if (cfg.capital_initial) document.getElementById('cfg-capital').value = cfg.capital_initial;
+  // Telegram (no mostramos token/chat_id por seguridad, solo opciones)
+  if (cfg.telegram_notify_filtered) {
+    document.getElementById('tg-filtered').value = cfg.telegram_notify_filtered;
+  }
+  if (cfg.telegram_notify_errors) {
+    document.getElementById('tg-errors').value = cfg.telegram_notify_errors;
+  }
+  if (cfg.telegram_chat_id) {
+    document.getElementById('tg-chat-id').value = cfg.telegram_chat_id;
+  }
 }
 
 async function saveApiConfig() {

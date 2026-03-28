@@ -25,6 +25,7 @@ print("✅ Base de datos lista")
 from core.binance_futures import binance
 from core.executor import executor
 from dashboard.dashboard import run_dashboard
+import core.telegram as tg
 
 
 # ── Ciclo principal del bot ───────────────────────────────────────
@@ -57,6 +58,10 @@ def bot_cycle():
     except Exception as e:
         print(f"[{ts}] ❌ Error en ciclo: {e}")
         log_event("CYCLE_ERROR", str(e), "ERROR")
+        try:
+            tg.notify_error("CYCLE_ERROR", str(e))
+        except Exception:
+            pass
 
 
 def health_check():
@@ -99,22 +104,30 @@ def main():
     print("  Estrategia D: Log+EMA · ACP · Macro · RR 3:1")
     print("=" * 55)
 
-    # 1. Verificar conexión Binance (no bloquear si falla)
+    # 1. Inicializar base de datos
+    init_db()
+    print("✅ Base de datos lista")
+
+    # 2. Verificar conexión Binance (no bloquear si falla)
     testnet = get_config("testnet", "true")
     print(f"🔗 Conectando a Binance {'TESTNET' if testnet == 'true' else 'PRODUCCIÓN'}...")
     if binance.ping():
         print("✅ Binance conectado")
         log_event("STARTUP", f"Bot iniciado — modo {'testnet' if testnet=='true' else 'producción'}")
+        try:
+            tg.notify_bot_started()
+        except Exception:
+            pass
     else:
         print("⚠️  Sin conexión a Binance (configura API keys en el dashboard)")
         log_event("STARTUP", "Bot iniciado sin conexión Binance — API keys pendientes", "WARNING")
 
-    # 2. Arrancar scheduler en hilo daemon
+    # 3. Arrancar scheduler en hilo daemon
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     print("✅ Scheduler activo — ciclo cada hora en :01")
 
-    # 3. Arrancar dashboard Flask (bloquea el hilo principal)
+    # 4. Arrancar dashboard Flask (bloquea el hilo principal)
     print("✅ Dashboard iniciando...")
     print(f"   URL: http://0.0.0.0:{os.getenv('PORT', 5000)}")
     print(f"   Usuario por defecto: admin / satevis2024")
