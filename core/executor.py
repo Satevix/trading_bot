@@ -75,58 +75,126 @@ class TradeExecutor:
         return {"action": "idle"}
 
     def _open_position(self, signal: dict, price: float, balance: float) -> dict:
-        """Abre una nueva posición."""
+        """
+        Abre una posición LONG únicamente (Strategy D es long-only).
+        Flujo:
+          1. Calcular parámetros con log de riesgo detallado
+          2. Configurar leverage + margen aislado
+          3. Enviar orden de entrada a mercado
+          4. Colocar SL como STOP_MARKET (garantiza ejecución)
+          5. Colocar TP como TAKE_PROFIT_MARKET
+          6. VERIFICAR que SL y TP quedaron activos en Binance
+          7. Registrar en BD con todos los parámetros
+        """
         direction = signal["direction"]
-        params    = strategy.calculate_order_params(direction, price, balance)
+
+        # Guard de seguridad adicional — nunca debería llegarse aquí con SHORT
+        if direction != 1:
+            log_event("TRADE_BLOCKED",
+                      f"Intento de abrir posición con direction={direction}. "
+                      f"Strategy D es LONG-only. Operación cancelada.", "ERROR")
+            return {"action": "blocked", "reason": "long_only_guard"}
+
+        params = strategy.calculate_order_params(direction, price, balance)
 
         if params["quantity"] < 0.001:
-            log_event("ORDER_SKIP", "Cantidad mínima no alcanzada (< 0.001 BTC)", "WARNING")
+            log_event("ORDER_SKIP",
+                      f"Cantidad insuficiente: {params['quantity']} BTC < 0.001. "
+                      f"capital_per_trade=${params['capital_per_trade']:.2f} "
+                      f"precio=${price:.2f}", "WARNING")
             return {"action": "skipped", "reason": "min_quantity"}
 
-        # Configurar apalancamiento y margen aislado
-        lev = int(get_config("leverage", "3"))
-        binance.set_leverage(self.symbol, lev)
-        binance.set_margin_type(self.symbol, "ISOLATED")
+        # ── Log de riesgo pre-orden ───────────────────────────────
+        log_event("PRE_TRADE",
+                  f"LONG BTCUSDT | "
+                  f"entrada_estimada=${price:.2f} | "
+                  f"margen=${params['capital_per_trade']:.2f} USDT | "
+                  f"notional=${params['position_usdt']:.2f} | "
+                  f"qty={params['quantity']:.3f} BTC | "
+                  f"SL=${params['sl_price']:.2f} ({self._sl_pct_display()}%) | "
+                  f"TP=${params['tp_price']:.2f} ({self._tp_pct_display()}%) | "
+                  f"liq_est=${params['liq_price']:.2f} | "
+                  f"pérdida_máx=${params['max_loss_usdt']:.2f} ({params['max_loss_pct']:.1f}% del margen) | "
+                  f"balance_antes=${balance:.2f}")
 
-        # Orden de entrada a mercado
-        side = "BUY" if direction == 1 else "SELL"
-        order = binance.place_market_order(
-            self.symbol, side, params["quantity"]
-        )
+        # ── Configurar leverage y margen ──────────────────────────
+        lev = int(get_config("leverage", "3"))
+        lev_ok = binance.set_leverage(self.symbol, lev)
+        mg_ok  = binance.set_margin_type(self.symbol, "ISOLATED")
+        log_event("TRADE_SETUP",
+                  f"leverage={lev}x configurado={lev_ok} | "
+                  f"margin=ISOLATED configurado={mg_ok}")
+
+        # ── Orden de entrada LONG (BUY a mercado) ─────────────────
+        order = binance.place_market_order(self.symbol, "BUY", params["quantity"])
 
         if not order:
-            log_event("ORDER_FAILED", f"Error al abrir {side}", "ERROR")
-            return {"action": "error", "reason": "order_failed"}
+            log_event("ORDER_FAILED",
+                      f"FALLO orden de entrada BUY {params['quantity']:.3f} BTC. "
+                      f"No se abrió posición.", "ERROR")
+            return {"action": "error", "reason": "entry_order_failed"}
 
-        # Precio real de ejecución
-        entry_price = float(order.get("avgPrice", price) or price)
+        entry_price = float(order.get("avgPrice") or order.get("price") or price)
         if entry_price == 0:
             entry_price = price
 
-        # Colocar SL como Stop-Limit
-        sl_side = "SELL" if direction == 1 else "BUY"
-        binance.place_stop_limit_order(
-            self.symbol, sl_side, params["quantity"],
-            params["sl_price"], params["sl_limit"]
+        log_event("ENTRY_FILLED",
+                  f"BUY ejecutado | orderId={order.get('orderId')} | "
+                  f"qty={params['quantity']:.3f} BTC | "
+                  f"avgPrice=${entry_price:.2f} | "
+                  f"status={order.get('status')}")
+
+        # ── Recalcular SL/TP con precio real de entrada ───────────
+        sl_pct = float(get_config("sl_pct", "2.0")) / 100
+        tp_pct = float(get_config("tp_pct", "3.0")) / 100
+        sl_price_real = round(entry_price * (1 - sl_pct), 2)
+        tp_price_real = round(entry_price * (1 + tp_pct), 2)
+
+        # ── Colocar SL como STOP_MARKET ───────────────────────────
+        sl_order = binance.place_stop_market_order(
+            self.symbol, "SELL", params["quantity"], sl_price_real
         )
 
-        # Colocar TP
-        binance.place_take_profit_order(
-            self.symbol, sl_side, params["quantity"],
-            params["tp_price"], params["tp_price"] * (0.999 if direction == 1 else 1.001)
+        # ── Colocar TP como TAKE_PROFIT_MARKET ────────────────────
+        tp_order = binance.place_take_profit_market_order(
+            self.symbol, "SELL", params["quantity"], tp_price_real
         )
 
-        # Registrar en BD
+        # ── VERIFICACIÓN CRÍTICA: confirmar SL y TP activos ───────
+        import time
+        time.sleep(1)  # esperar 1s para que Binance procese las órdenes
+        verify = binance.verify_sl_tp_active(self.symbol)
+
+        if not verify["sl_active"]:
+            log_event("SL_NOT_CONFIRMED",
+                      f"ALERTA CRÍTICA: SL no confirmado en Binance tras apertura. "
+                      f"Posición abierta SIN stop loss activo. "
+                      f"Órdenes visibles: {verify['summary']}", "ERROR")
+            try:
+                import core.telegram as tg
+                tg.notify_error("SL_NOT_CONFIRMED",
+                                f"SL no confirmado en Binance. "
+                                f"Posición LONG abierta @ ${entry_price:.2f} SIN stop loss. "
+                                f"Revisar manualmente.")
+            except Exception:
+                pass
+
+        if not verify["tp_active"]:
+            log_event("TP_NOT_CONFIRMED",
+                      f"TP no confirmado en Binance tras apertura. "
+                      f"Órdenes visibles: {verify['summary']}", "WARNING")
+
+        # ── Registrar en BD ───────────────────────────────────────
         now = datetime.now(timezone.utc).isoformat()
         trade_id = insert_trade({
             "binance_order_id": str(order.get("orderId", "")),
             "symbol":           self.symbol,
-            "side":             "LONG" if direction == 1 else "SHORT",
+            "side":             "LONG",
             "entry_price":      round(entry_price, 2),
             "quantity":         params["quantity"],
             "size_usdt":        round(entry_price * params["quantity"], 2),
-            "sl_price":         params["sl_price"],
-            "tp_price":         params["tp_price"],
+            "sl_price":         sl_price_real,
+            "tp_price":         tp_price_real,
             "liq_price":        params["liq_price"],
             "leverage":         lev,
             "open_fee":         params["open_fee"],
@@ -135,39 +203,61 @@ class TradeExecutor:
             "log_bias":         signal["log_bias"],
             "opened_at":        now,
             "capital_before":   round(balance, 2),
+            "notes":            (
+                f"sl_order_id={sl_order.get('orderId') if sl_order else 'FALLO'} | "
+                f"tp_order_id={tp_order.get('orderId') if tp_order else 'FALLO'} | "
+                f"sl_confirmed={verify['sl_active']} | "
+                f"tp_confirmed={verify['tp_active']} | "
+                f"capital_per_trade={params['capital_per_trade']:.2f} | "
+                f"max_loss_usdt={params['max_loss_usdt']:.2f}"
+            ),
         })
 
         log_event("TRADE_OPENED",
-                  f"#{trade_id} {side} {params['quantity']} BTC @ ${entry_price:.2f} "
-                  f"SL=${params['sl_price']:.2f} TP=${params['tp_price']:.2f}")
+                  f"TRADE #{trade_id} LONG {params['quantity']:.3f} BTC @ ${entry_price:.2f} | "
+                  f"SL=${sl_price_real:.2f} TP=${tp_price_real:.2f} | "
+                  f"margen=${params['capital_per_trade']:.2f} | "
+                  f"notional=${params['position_usdt']:.2f} | "
+                  f"sl_ok={verify['sl_active']} tp_ok={verify['tp_active']} | "
+                  f"balance_antes=${balance:.2f}")
 
-        # Notificación Telegram (no interrumpe si falla)
+        # ── Notificación Telegram ─────────────────────────────────
         try:
             tg.notify_trade_opened({
-                "side":           "LONG" if direction == 1 else "SHORT",
+                "side":           "LONG",
                 "entry_price":    entry_price,
                 "quantity":       params["quantity"],
                 "size_usdt":      params["position_usdt"],
-                "sl_price":       params["sl_price"],
-                "tp_price":       params["tp_price"],
+                "sl_price":       sl_price_real,
+                "tp_price":       tp_price_real,
                 "liq_price":      params["liq_price"],
                 "leverage":       lev,
                 "capital_before": balance,
                 "acp_angle":      signal.get("acp_angle", 0),
                 "open_fee":       params["open_fee"],
+                "sl_confirmed":   verify["sl_active"],
+                "tp_confirmed":   verify["tp_active"],
             })
         except Exception:
             pass
 
         return {
-            "action":    "opened",
-            "trade_id":  trade_id,
-            "side":      side,
-            "entry":     entry_price,
-            "quantity":  params["quantity"],
-            "sl":        params["sl_price"],
-            "tp":        params["tp_price"],
+            "action":       "opened",
+            "trade_id":     trade_id,
+            "side":         "LONG",
+            "entry":        entry_price,
+            "quantity":     params["quantity"],
+            "sl":           sl_price_real,
+            "tp":           tp_price_real,
+            "sl_confirmed": verify["sl_active"],
+            "tp_confirmed": verify["tp_active"],
         }
+
+    def _sl_pct_display(self) -> str:
+        return get_config("sl_pct", "2.0")
+
+    def _tp_pct_display(self) -> str:
+        return get_config("tp_pct", "3.0")
 
     def _manage_open_position(
         self, trade_db: dict, live_pos: dict, price: float, balance: float

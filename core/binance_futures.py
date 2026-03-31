@@ -24,12 +24,22 @@ class BinanceFutures:
         self._refresh_keys()
 
     def _refresh_keys(self):
-        """Recarga las keys desde la BD (permite actualización sin reiniciar)."""
-        self.api_key    = get_config("binance_api_key", "")
-        self.api_secret = get_config("binance_secret", "")
-        testnet_str     = get_config("testnet", "true")
-        self.testnet    = testnet_str.lower() == "true"
-        self.base_url   = self.BASE_TEST if self.testnet else self.BASE_LIVE
+        """
+        Recarga credenciales con prioridad: env var > BD.
+        En Render: definir BINANCE_API_KEY y BINANCE_SECRET como variables
+        de entorno para que sobrevivan reinicios de la BD SQLite.
+        """
+        self.api_key    = (os.getenv("BINANCE_API_KEY", "").strip()
+                           or get_config("binance_api_key", ""))
+        self.api_secret = (os.getenv("BINANCE_SECRET", "").strip()
+                           or get_config("binance_secret", ""))
+        testnet_env     = os.getenv("BINANCE_TESTNET", "").strip().lower()
+        if testnet_env in ("true", "false"):
+            testnet_str = testnet_env
+        else:
+            testnet_str = get_config("testnet", "true")
+        self.testnet  = testnet_str.lower() == "true"
+        self.base_url = self.BASE_TEST if self.testnet else self.BASE_LIVE
 
     def _sign(self, params: dict) -> dict:
         params["timestamp"] = int(time.time() * 1000)
@@ -170,69 +180,119 @@ class BinanceFutures:
                       f"{side} {quantity:.4f} {symbol} @ market | ID={r.get('orderId')}")
         return r
 
-    def place_stop_limit_order(
+    def place_stop_market_order(
         self,
         symbol: str,
         side: str,
         quantity: float,
         stop_price: float,
-        limit_price: float,
         reduce_only: bool = True
     ) -> dict | None:
         """
-        Stop-Limit para SL — más seguro que Stop-Market contra slippage.
-        El limit_price debe ser ligeramente peor que stop_price (buffer del 0.1%).
+        Stop-Market para SL — garantiza ejecución aunque el precio salte el nivel.
+        STOP_MARKET activa una orden de mercado cuando se toca el stop_price.
+        Preferido sobre STOP (stop-limit) para SL: nunca se queda sin ejecutar
+        por un gap de precio.
+        side: 'SELL' para cerrar LONG, 'BUY' para cerrar SHORT
         """
         params = {
-            "symbol":        symbol,
-            "side":          side,
-            "type":          "STOP",
-            "quantity":      round(quantity, 3),
-            "stopPrice":     round(stop_price, 2),
-            "price":         round(limit_price, 2),
-            "reduceOnly":    "true" if reduce_only else "false",
-            "timeInForce":   "GTC",
+            "symbol":      symbol,
+            "side":        side,
+            "type":        "STOP_MARKET",
+            "quantity":    round(quantity, 3),
+            "stopPrice":   round(stop_price, 2),
+            "reduceOnly":  "true" if reduce_only else "false",
         }
         r = self._post("/fapi/v1/order", params)
         if r:
             log_event("SL_PLACED",
-                      f"SL {side} {quantity:.4f} @ stop={stop_price:.2f} lim={limit_price:.2f}")
+                      f"SL STOP_MARKET {side} {quantity:.3f} BTC @ trigger=${stop_price:.2f} "
+                      f"| orderId={r.get('orderId')} | status={r.get('status')}")
+        else:
+            log_event("SL_FAILED",
+                      f"FALLO al colocar SL STOP_MARKET {side} {quantity:.3f} @ ${stop_price:.2f}. "
+                      f"POSICIÓN SIN STOP LOSS ACTIVO.", "ERROR")
         return r
 
-    def place_take_profit_order(
+    def place_take_profit_market_order(
         self,
         symbol: str,
         side: str,
         quantity: float,
         stop_price: float,
-        limit_price: float,
         reduce_only: bool = True
     ) -> dict | None:
-        """Take-profit como orden TAKE_PROFIT_MARKET."""
+        """
+        Take-Profit Market — activa una orden de mercado cuando se toca stop_price.
+        Más simple y confiable que TAKE_PROFIT (limit) para el TP.
+        """
         params = {
             "symbol":      symbol,
             "side":        side,
-            "type":        "TAKE_PROFIT",
+            "type":        "TAKE_PROFIT_MARKET",
             "quantity":    round(quantity, 3),
             "stopPrice":   round(stop_price, 2),
-            "price":       round(limit_price, 2),
             "reduceOnly":  "true" if reduce_only else "false",
-            "timeInForce": "GTC",
         }
         r = self._post("/fapi/v1/order", params)
         if r:
             log_event("TP_PLACED",
-                      f"TP {side} {quantity:.4f} @ stop={stop_price:.2f}")
+                      f"TP TAKE_PROFIT_MARKET {side} {quantity:.3f} BTC @ trigger=${stop_price:.2f} "
+                      f"| orderId={r.get('orderId')} | status={r.get('status')}")
+        else:
+            log_event("TP_FAILED",
+                      f"FALLO al colocar TP {side} {quantity:.3f} @ ${stop_price:.2f}.", "WARNING")
         return r
 
     def cancel_all_orders(self, symbol: str) -> bool:
-        """Cancela todas las órdenes abiertas de un símbolo."""
-        r = self._post("/fapi/v1/allOpenOrders",
-                       {"symbol": symbol})
-        if r:
-            log_event("ORDERS_CANCELLED", f"Todas las órdenes de {symbol} canceladas")
+        """
+        Cancela todas las órdenes abiertas de un símbolo.
+        IMPORTANTE: Binance Futures requiere método DELETE para cancelación masiva.
+        """
+        self._refresh_keys()
+        params = self._sign({"symbol": symbol})
+        try:
+            r = requests.delete(
+                self.base_url + "/fapi/v1/allOpenOrders",
+                params=params,
+                headers=self._headers(),
+                timeout=10
+            )
+            r.raise_for_status()
+            result = r.json()
+            log_event("ORDERS_CANCELLED",
+                      f"Órdenes canceladas para {symbol} | respuesta: {str(result)[:100]}")
             return True
-        return False
+        except requests.RequestException as e:
+            log_event("CANCEL_FAILED", f"Error al cancelar órdenes {symbol}: {e}", "ERROR")
+            return False
+
+    def verify_sl_tp_active(self, symbol: str) -> dict:
+        """
+        Verifica que existan órdenes SL y TP activas en Binance para el símbolo.
+        Retorna: {"sl_active": bool, "tp_active": bool, "orders": list}
+        Llamar después de abrir una posición para confirmar que las órdenes llegaron.
+        """
+        orders = self.get_open_orders(symbol)
+        sl_active = any(
+            o.get("type") in ("STOP_MARKET", "STOP") for o in orders
+        )
+        tp_active = any(
+            o.get("type") in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT") for o in orders
+        )
+        order_summary = [
+            f"{o.get('type')} {o.get('side')} @ ${float(o.get('stopPrice',0)):.2f}"
+            for o in orders
+        ]
+        log_event("SL_TP_VERIFY",
+                  f"symbol={symbol} | SL_activo={sl_active} | TP_activo={tp_active} | "
+                  f"órdenes={order_summary}")
+        return {
+            "sl_active": sl_active,
+            "tp_active": tp_active,
+            "orders":    orders,
+            "summary":   order_summary,
+        }
 
     def get_open_orders(self, symbol: str) -> list:
         return self._get("/fapi/v1/openOrders", {"symbol": symbol}, signed=True) or []

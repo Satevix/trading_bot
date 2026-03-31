@@ -169,43 +169,109 @@ def api_candles():
 @app.route("/api/capital")
 @login_required
 def api_capital():
-    """Curva de equity y movimientos de capital."""
+    """Curva de equity, movimientos automáticos detectados y balance en vivo."""
     history   = get_capital_history(500)
     movements = get_capital_movements(100)
+    balance   = binance.get_balance()
     return jsonify({
-        "ok":       True,
-        "history":  history,
-        "movements": movements,
+        "ok":            True,
+        "history":       history,
+        "movements":     movements,
+        "balance_live":  round(balance, 2),
     })
 
 
-@app.route("/api/capital/movement", methods=["POST"])
+@app.route("/api/capital/snapshot", methods=["POST"])
 @login_required
-def api_capital_movement():
-    """Registrar ingreso o egreso manual de capital."""
-    data   = request.get_json()
-    type_  = data.get("type", "DEPOSIT").upper()
-    amount = float(data.get("amount", 0))
-    desc   = data.get("description", "")
-
-    if type_ not in ("DEPOSIT", "WITHDRAWAL"):
-        return jsonify({"ok": False, "error": "tipo inválido"})
-    if amount <= 0:
-        return jsonify({"ok": False, "error": "monto inválido"})
-
+def api_capital_snapshot():
+    """
+    Toma un snapshot del balance actual desde Binance y lo registra.
+    Si detecta una diferencia significativa vs el último registro,
+    la clasifica como DEPOSIT o WITHDRAWAL automáticamente.
+    """
     balance = binance.get_balance()
-    adj_amount = amount if type_ == "DEPOSIT" else -amount
-    balance_after = balance + adj_amount
+    if balance <= 0:
+        return jsonify({"ok": False, "error": "Sin conexión a Binance o balance cero"})
 
-    add_capital_movement(type_, adj_amount, desc, balance_after)
-    log_event("CAPITAL_MOVEMENT", f"{type_} ${amount:.2f} — {desc}")
+    history = get_capital_history(1)
+    last_balance = float(history[0]["balance"]) if history else 0.0
+    diff = round(balance - last_balance, 2)
 
-    return jsonify({"ok": True, "balance_after": balance_after})
+    movement_type = None
+    if abs(diff) >= 1.0:  # umbral: diferencias < $1 se ignoran (fees, funding)
+        movement_type = "DEPOSIT" if diff > 0 else "WITHDRAWAL"
+        desc = (f"Detectado automáticamente: "
+                f"{'depósito' if diff > 0 else 'retiro'} de ${abs(diff):.2f}")
+        add_capital_movement(movement_type, diff, desc, balance)
+        log_event("CAPITAL_AUTO",
+                  f"{movement_type} detectado: ${diff:+.2f} | "
+                  f"balance_anterior=${last_balance:.2f} → balance_actual=${balance:.2f}")
+    else:
+        record_capital(balance, "AUTO", "Snapshot periódico")
+
+    return jsonify({
+        "ok":           True,
+        "balance":      round(balance, 2),
+        "prev_balance": round(last_balance, 2),
+        "diff":         diff,
+        "movement":     movement_type,
+    })
 
 
-@app.route("/api/config")
+@app.route("/api/indicators")
 @login_required
-def api_config():
+def api_indicators():
+    """
+    Calcula SMA_Log(144) y EMA(200) sobre velas reales de Binance
+    para superponerlas en el gráfico de velas del dashboard.
+    Devuelve series de tiempo con timestamps y valores.
+    """
+    import math
+    interval = request.args.get("interval", "1h")
+    limit    = int(request.args.get("limit", 400))
+    symbol   = get_config("symbol", "BTCUSDT")
+
+    candles = binance.get_klines(symbol, interval, min(limit, 1000))
+    if not candles:
+        return jsonify({"ok": False, "error": "Sin datos de velas"})
+
+    closes = [c["close"] for c in candles]
+    times  = [c["t"] for c in candles]
+    n      = len(closes)
+
+    # ── SMA_Log(144) ─────────────────────────────────────────────
+    sml_period = int(get_config("sma_log_period", "144"))
+    log_c = [math.log10(max(x, 1e-10)) for x in closes]
+    sml_series = []
+    for i in range(n):
+        if i >= sml_period - 1:
+            val = 10 ** (sum(log_c[i - sml_period + 1:i + 1]) / sml_period)
+            sml_series.append({"t": times[i], "v": round(val, 2)})
+
+    # ── EMA(200) ──────────────────────────────────────────────────
+    ema_period = int(get_config("macro_ema", "200"))
+    k = 2 / (ema_period + 1)
+    ema_vals = [0.0] * n
+    if ema_period <= n:
+        ema_vals[ema_period - 1] = sum(closes[:ema_period]) / ema_period
+    for i in range(ema_period, n):
+        ema_vals[i] = closes[i] * k + ema_vals[i - 1] * (1 - k)
+
+    ema_series = [
+        {"t": times[i], "v": round(ema_vals[i], 2)}
+        for i in range(ema_period - 1, n)
+        if ema_vals[i] > 0
+    ]
+
+    return jsonify({
+        "ok":       True,
+        "sma_log":  sml_series,
+        "ema200":   ema_series,
+        "interval": interval,
+    })
+
+
+
     """Configuración actual de la estrategia (lectura)."""
     cfg = get_all_config()
     # No exponer secrets al frontend
@@ -221,7 +287,7 @@ def api_config_update():
     data = request.get_json()
     allowed = {
         "binance_api_key", "binance_secret", "testnet",
-        "capital_initial", "leverage", "risk_pct",
+        "capital_initial", "capital_per_trade", "leverage", "risk_pct",
         "sl_pct", "tp_pct", "acp_threshold",
         "bot_status",
     }
@@ -279,6 +345,7 @@ def api_telegram_config():
     notify_errors   = data.get("notify_errors", "true")
     do_test = data.get("test", False)
 
+    # Guardar siempre antes de hacer el test
     if token:
         set_config("telegram_token", token)
     if chat_id:
@@ -287,13 +354,24 @@ def api_telegram_config():
     set_config("telegram_notify_errors",   notify_errors)
 
     if do_test:
-        ok = tg.test_connection()
+        # Usar token/chat_id del request directamente (no releer de BD)
+        # para garantizar que el test usa los valores recién ingresados
+        test_token   = token   or get_config("telegram_token",   "")
+        test_chat_id = chat_id or get_config("telegram_chat_id", "")
+
+        if not test_token or not test_chat_id:
+            return jsonify({"ok": False,
+                            "error": "Token y Chat ID son requeridos para enviar la prueba."})
+
+        # Test directo con las credenciales del request
+        ok = tg.test_connection_direct(test_token, test_chat_id)
         if not ok:
             return jsonify({"ok": False,
                             "error": "No se pudo enviar el mensaje. "
-                                     "Verifica el token y chat_id."})
-        log_event("TELEGRAM_TEST", f"Prueba exitosa — chat_id={chat_id}")
-        return jsonify({"ok": True, "message": "Mensaje de prueba enviado ✓"})
+                                     "Verifica que el token sea válido y que hayas "
+                                     "iniciado una conversación con tu bot en Telegram."})
+        log_event("TELEGRAM_TEST", f"Prueba exitosa — chat_id={test_chat_id}")
+        return jsonify({"ok": True, "message": "✓ Mensaje de prueba enviado correctamente"})
 
     log_event("TELEGRAM_CONFIG", "Configuración de Telegram guardada")
     return jsonify({"ok": True})
@@ -310,6 +388,53 @@ def api_change_password():
     change_password(session["username"], new_pw)
     log_event("PASSWORD_CHANGED", f"Usuario {session['username']}")
     return jsonify({"ok": True})
+
+
+@app.route("/api/credentials/status")
+@login_required
+def api_credentials_status():
+    """
+    Informa el origen de cada credencial crítica:
+    'env' = viene de variable de entorno (persiste en reinicios)
+    'db'  = viene de la base de datos SQLite (se pierde en redeploy)
+    'missing' = no configurada en ningún lado
+    """
+    import os
+    from core.database import get_config as _gc
+
+    def _src(env_var, db_key):
+        if os.getenv(env_var, "").strip():
+            return "env"
+        if _gc(db_key, ""):
+            return "db"
+        return "missing"
+
+    api_key_src  = _src("BINANCE_API_KEY", "binance_api_key")
+    secret_src   = _src("BINANCE_SECRET",  "binance_secret")
+    pw_src       = "env" if (os.getenv("ADMIN_PASSWORD_HASH") or
+                              os.getenv("ADMIN_PASSWORD")) else "db"
+    tg_src       = _src("TELEGRAM_TOKEN", "telegram_token")
+    testnet_src  = "env" if os.getenv("BINANCE_TESTNET", "").strip() else "db"
+
+    # Conectividad Binance
+    connected = binance.ping()
+
+    return jsonify({
+        "ok": True,
+        "credentials": {
+            "binance_api_key": api_key_src,
+            "binance_secret":  secret_src,
+            "admin_password":  pw_src,
+            "telegram_token":  tg_src,
+            "testnet_mode":    testnet_src,
+        },
+        "binance_connected": connected,
+        "warning": (
+            "Algunas credenciales están solo en BD (se perderán en redeploy). "
+            "Configura las variables de entorno en Render para persistencia total."
+            if any(s == "db" for s in [api_key_src, secret_src, pw_src]) else ""
+        )
+    })
 
 
 @app.route("/health")
@@ -505,6 +630,44 @@ tr:hover td{background:var(--bg2);}
 
 /* ── Equity chart ── */
 .equity-wrap{height:220px;position:relative;}
+
+/* ── Indicadores toggle ── */
+.ind-toggle{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;}
+.ind-btn{padding:3px 10px;border-radius:5px;border:1px solid var(--border);
+  background:var(--bg2);font-size:11px;cursor:pointer;transition:all .18s;}
+.ind-btn.active-sml{border-color:#ffb300;color:#ffb300;background:rgba(255,179,0,.08);}
+.ind-btn.active-ema{border-color:#2979ff;color:#2979ff;background:rgba(41,121,255,.08);}
+
+/* ── Responsividad móvil ── */
+@media(max-width:768px){
+  .topbar{padding:8px 12px;gap:8px;flex-wrap:wrap;}
+  .topbar-right{gap:6px;}
+  .refresh-info{display:none;}
+  .price-live{font-size:13px;}
+  .logo{font-size:15px;}
+  .btn-sm{padding:4px 8px;font-size:10px;}
+  .nav{padding:0 8px;overflow-x:auto;gap:0;}
+  .nav-tab{padding:8px 10px;font-size:11px;white-space:nowrap;}
+  main{padding:12px 10px 48px;}
+  .two-col{grid-template-columns:1fr;}
+  .kpi-grid{grid-template-columns:repeat(2,1fr);}
+  .form-grid{grid-template-columns:1fr;}
+  .form-group[style*="grid-column"]{grid-column:1 !important;}
+  #candle-chart{height:280px;}
+  .equity-wrap{height:180px;}
+  .tbl-wrap{max-height:360px;}
+  table{font-size:11px;}
+  th,td{padding:6px 8px;}
+  .pos-grid{grid-template-columns:1fr 1fr;}
+  .card{padding:12px;}
+  .card-title{font-size:9px;}
+  .kpi-v{font-size:16px;}
+}
+@media(max-width:420px){
+  .kpi-grid{grid-template-columns:1fr 1fr;}
+  .topbar{justify-content:space-between;}
+  .bot-status{display:none;}
+}
 </style>
 </head>
 <body>
@@ -559,13 +722,26 @@ tr:hover td{background:var(--bg2);}
 <div class="section" id="sec-chart">
   <div class="card">
     <div class="card-title">BTC/USDT — Velas con operaciones marcadas</div>
-    <div class="tf-pills">
-      <button class="tf-pill active" onclick="loadChart('15m',this)">15m</button>
-      <button class="tf-pill" onclick="loadChart('1h',this)">1h</button>
-      <button class="tf-pill" onclick="loadChart('4h',this)">4h</button>
-      <button class="tf-pill" onclick="loadChart('1d',this)">1d</button>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
+      <div class="tf-pills" style="margin-bottom:0">
+        <button class="tf-pill active" onclick="loadChart('15m',this)">15m</button>
+        <button class="tf-pill" onclick="loadChart('1h',this)">1h</button>
+        <button class="tf-pill" onclick="loadChart('4h',this)">4h</button>
+        <button class="tf-pill" onclick="loadChart('1d',this)">1d</button>
+      </div>
+      <div class="ind-toggle">
+        <button class="ind-btn" id="btn-sml" onclick="toggleIndicator('sml')">SMA Log 144</button>
+        <button class="ind-btn" id="btn-ema" onclick="toggleIndicator('ema')">EMA 200</button>
+      </div>
     </div>
     <div id="candle-chart"></div>
+    <div style="margin-top:8px;font-size:10px;color:var(--muted)">
+      <span style="color:#ffb300">■</span> SMA Log 144 &nbsp;
+      <span style="color:#2979ff">■</span> EMA 200 (filtro macro) &nbsp;
+      <span style="color:#aa66ff">▲</span> Apertura LONG &nbsp;
+      <span style="color:#00e676">●</span> TP &nbsp;
+      <span style="color:#ff3d5a">●</span> SL
+    </div>
   </div>
 </div>
 
@@ -579,31 +755,23 @@ tr:hover td{background:var(--bg2);}
 
 <!-- ═══ CAPITAL ═══ -->
 <div class="section" id="sec-capital">
+  <div class="kpi-grid" id="capital-kpis"></div>
   <div class="card">
-    <div class="card-title">Registrar movimiento de capital</div>
-    <div class="form-grid">
-      <div class="form-group">
-        <label>Tipo</label>
-        <select id="mv-type">
-          <option value="DEPOSIT">Ingreso</option>
-          <option value="WITHDRAWAL">Egreso</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Monto (USDT)</label>
-        <input type="number" id="mv-amount" min="1" step="0.01" placeholder="100.00">
-      </div>
-      <div class="form-group" style="grid-column:1/-1">
-        <label>Descripción</label>
-        <input type="text" id="mv-desc" placeholder="Depósito inicial, retiro de ganancias...">
-      </div>
+    <div class="card-title">
+      Movimientos de capital detectados automáticamente
+      <button class="btn-sm" onclick="takeSnapshot()" style="margin-left:auto">↻ Sincronizar con Binance</button>
     </div>
-    <div style="margin-top:12px"><button class="btn-primary" onclick="submitMovement()">Registrar movimiento</button></div>
-    <div id="mv-alert" style="margin-top:10px"></div>
+    <div id="snapshot-alert" style="margin-bottom:10px"></div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:12px;line-height:1.6">
+      El balance se sincroniza automáticamente cada hora. Si realizaste un depósito
+      o retiro, usa el botón para detectarlo ahora. Diferencias menores a $1 se
+      ignoran (son fees y funding).
+    </div>
+    <div class="tbl-wrap" id="movements-wrap"></div>
   </div>
   <div class="card">
-    <div class="card-title">Historial de movimientos de capital</div>
-    <div class="tbl-wrap" id="movements-wrap"></div>
+    <div class="card-title">Curva de equity</div>
+    <div class="equity-wrap"><canvas id="equity-chart-capital"></canvas></div>
   </div>
 </div>
 
@@ -621,9 +789,25 @@ tr:hover td{background:var(--bg2);}
 
 <!-- ═══ SETTINGS ═══ -->
 <div class="section" id="sec-settings">
+
+  <!-- Panel de estado de credenciales -->
+  <div class="card" id="cred-status-card">
+    <div class="card-title">Estado de credenciales del sistema</div>
+    <div id="cred-status-wrap" style="font-size:12px;line-height:2"></div>
+    <div style="margin-top:12px;padding:12px;background:var(--bg2);border-radius:8px;
+      font-size:11px;color:var(--muted);line-height:1.8;">
+      <strong style="color:var(--text)">Variables de entorno recomendadas en Render:</strong><br>
+      <code>BINANCE_API_KEY</code> · <code>BINANCE_SECRET</code> · <code>BINANCE_TESTNET</code> (true/false)<br>
+      <code>ADMIN_PASSWORD_HASH</code> · <code>TELEGRAM_TOKEN</code> · <code>TELEGRAM_CHAT_ID</code><br>
+      <span style="color:var(--gold)">⚠ Credenciales marcadas como "BD" se perderán en cada redeploy.</span><br>
+      Para obtener el hash de tu contraseña:<br>
+      <code>python3 -c "import hashlib; print(hashlib.sha256(b'tucontraseña').hexdigest())"</code>
+    </div>
+  </div>
+
   <div class="two-col">
     <div class="card">
-      <div class="card-title">API Keys Binance (encriptadas en BD)</div>
+      <div class="card-title">API Keys Binance</div>
       <div class="form-grid">
         <div class="form-group" style="grid-column:1/-1">
           <label>API Key</label>
@@ -634,88 +818,108 @@ tr:hover td{background:var(--bg2);}
           <input type="password" id="cfg-secret" placeholder="Dejar vacío para mantener actual">
         </div>
         <div class="form-group">
-          <label>Modo</label>
+          <label>Modo de operación</label>
           <select id="cfg-testnet">
             <option value="true">TESTNET (recomendado)</option>
             <option value="false">PRODUCCIÓN (dinero real)</option>
           </select>
         </div>
         <div class="form-group">
-          <label>Capital inicial (USDT)</label>
+          <label>Capital inicial referencia (USDT)</label>
           <input type="number" id="cfg-capital" min="10" step="1">
         </div>
+        <div class="form-group" style="grid-column:1/-1">
+          <label>Capital por operación (USDT) — margen comprometido por trade</label>
+          <input type="number" id="cfg-capital-trade" min="0" step="1"
+            placeholder="Ej: 100 → notional $300 con 3x leverage">
+        </div>
       </div>
-      <div style="margin-top:12px"><button class="btn-primary" onclick="saveApiConfig()">Guardar API Keys</button></div>
+      <div style="margin-top:12px"><button class="btn-primary" onclick="saveApiConfig()">Guardar configuración</button></div>
       <div id="api-alert" style="margin-top:10px"></div>
+      <div style="margin-top:10px;font-size:11px;color:var(--muted);line-height:1.7">
+        <strong style="color:var(--text)">Capital por operación:</strong>
+        Es el margen que el bot compromete en cada trade. Con 3x leverage,
+        un capital de $100 genera una posición notional de $300.
+        La pérdida máxima por trade = capital × SL% × leverage.
+        Ejemplo: $100 × 2% × 3 = $6 pérdida máxima.
+      </div>
     </div>
     <div class="card">
-      <div class="card-title">Parámetros de la estrategia D (solo visualización)</div>
+      <div class="card-title">Parámetros de la estrategia D</div>
       <table class="cfg-table" id="cfg-table"></table>
       <div style="margin-top:14px;font-size:11px;color:var(--muted)">
-        Los parámetros de estrategia se configuran directamente en el código
-        para garantizar integridad del backtesting validado.
+        Los parámetros de estrategia están fijados por el backtesting validado.
+        Modifícalos solo si entiendes el impacto en el comportamiento del bot.
       </div>
     </div>
   </div>
+
+  <!-- Notificaciones Telegram — solo visible en esta sección -->
   <div class="card">
-    <div class="card-title">Cambiar contraseña</div>
+    <div class="card-title">🔔 Notificaciones por Telegram</div>
+    <div class="form-grid">
+      <div class="form-group" style="grid-column:1/-1">
+        <label>Bot Token (obtenido de @BotFather)</label>
+        <input type="password" id="tg-token" placeholder="Dejar vacío para mantener actual">
+      </div>
+      <div class="form-group" style="grid-column:1/-1">
+        <label>Chat ID (tu ID personal de Telegram)</label>
+        <input type="text" id="tg-chat-id" placeholder="Ej: 123456789">
+      </div>
+      <div class="form-group">
+        <label>Notificar señales filtradas (verbose)</label>
+        <select id="tg-filtered">
+          <option value="false">No (recomendado)</option>
+          <option value="true">Sí</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Notificar errores críticos</label>
+        <select id="tg-errors">
+          <option value="true">Sí (recomendado)</option>
+          <option value="false">No</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
+      <button class="btn-primary" onclick="saveTelegram(false)">Guardar configuración</button>
+      <button class="btn-sm" onclick="saveTelegram(true)" style="padding:10px 16px;">
+        📨 Guardar y enviar mensaje de prueba
+      </button>
+    </div>
+    <div id="tg-alert" style="margin-top:10px"></div>
+    <div style="margin-top:14px;padding:12px;background:var(--bg2);border-radius:8px;
+      font-size:11px;color:var(--muted);line-height:1.8;">
+      <strong style="color:var(--text)">Cómo configurar en 2 minutos:</strong><br>
+      1. Abre Telegram → busca <code>@BotFather</code> → envía <code>/newbot</code><br>
+      2. Sigue las instrucciones → copia el <strong>token</strong> que te entrega<br>
+      3. Busca <code>@userinfobot</code> en Telegram → envía cualquier mensaje → copia tu <strong>ID</strong><br>
+      4. Pega token e ID aquí → clic en "Guardar y enviar mensaje de prueba"
+    </div>
+  </div>
+
+  <!-- Cambiar contraseña -->
+  <div class="card">
+    <div class="card-title">Cambiar contraseña del dashboard</div>
     <div class="form-grid">
       <div class="form-group">
         <label>Nueva contraseña (mín. 8 caracteres)</label>
         <input type="password" id="new-pw" placeholder="Nueva contraseña">
       </div>
       <div class="form-group">
-        <label>Confirmar</label>
+        <label>Confirmar contraseña</label>
         <input type="password" id="new-pw2" placeholder="Repetir contraseña">
       </div>
     </div>
     <div style="margin-top:12px"><button class="btn-primary" onclick="changePassword()">Cambiar contraseña</button></div>
     <div id="pw-alert" style="margin-top:10px"></div>
+    <div style="margin-top:10px;font-size:11px;color:var(--muted)">
+      ⚠ Si el bot está en Render sin la variable <code>ADMIN_PASSWORD_HASH</code>,
+      la contraseña se perderá en el próximo redeploy. Configura esa variable de entorno
+      para que persista permanentemente.
+    </div>
   </div>
-</div>
 
-<!-- Telegram config (full width below settings grid) -->
-<div class="card">
-  <div class="card-title">🔔 Notificaciones por Telegram</div>
-  <div class="form-grid">
-    <div class="form-group" style="grid-column:1/-1">
-      <label>Bot Token (obtenido de @BotFather)</label>
-      <input type="password" id="tg-token" placeholder="Dejar vacío para mantener actual">
-    </div>
-    <div class="form-group" style="grid-column:1/-1">
-      <label>Chat ID (tu ID personal de Telegram)</label>
-      <input type="text" id="tg-chat-id" placeholder="Ej: 123456789">
-    </div>
-    <div class="form-group">
-      <label>Notificar señales filtradas (verbose)</label>
-      <select id="tg-filtered">
-        <option value="false">No (recomendado)</option>
-        <option value="true">Sí</option>
-      </select>
-    </div>
-    <div class="form-group">
-      <label>Notificar errores críticos</label>
-      <select id="tg-errors">
-        <option value="true">Sí (recomendado)</option>
-        <option value="false">No</option>
-      </select>
-    </div>
-  </div>
-  <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;">
-    <button class="btn-primary" onclick="saveTelegram(false)">Guardar configuración</button>
-    <button class="btn-sm" onclick="saveTelegram(true)" style="padding:10px 16px;">
-      📨 Guardar y enviar mensaje de prueba
-    </button>
-  </div>
-  <div id="tg-alert" style="margin-top:10px"></div>
-  <div style="margin-top:14px;padding:12px;background:var(--bg2);border-radius:8px;
-    font-size:11px;color:var(--muted);line-height:1.8;">
-    <strong style="color:var(--text)">Cómo configurar en 2 minutos:</strong><br>
-    1. Abre Telegram → busca <code>@BotFather</code> → envía <code>/newbot</code><br>
-    2. Sigue las instrucciones → copia el <strong>token</strong> que te entrega<br>
-    3. Busca <code>@userinfobot</code> en Telegram → envía cualquier mensaje → copia tu <strong>ID</strong><br>
-    4. Pega token e ID aquí → clic en "Guardar y enviar mensaje de prueba"
-  </div>
 </div>
 
 </main>
@@ -739,11 +943,28 @@ function showSection(name) {
     if (t.textContent.toLowerCase().includes(name.substring(0,4))) t.classList.add('active');
   });
   currentSection = name;
-  if (name === 'chart') loadChart('1h');
-  if (name === 'trades') loadTrades();
-  if (name === 'capital') loadCapital();
-  if (name === 'signals') loadSignals();
-  if (name === 'settings') loadConfig();
+  if (name === 'chart')    loadChart('1h');
+  if (name === 'trades')   loadTrades();
+  if (name === 'capital')  loadCapital();
+  if (name === 'signals')  loadSignals();
+  if (name === 'settings') { loadConfig(); loadCredentialStatus(); }
+}
+
+// ── Zona horaria Colombia (UTC-5) ──────────────────────────────────
+function toColombiaTime(utcStr) {
+  if (!utcStr) return '—';
+  try {
+    // Asegurar que el string se interprete como UTC
+    const s = utcStr.replace(' ', 'T');
+    const d = new Date(s.endsWith('Z') || s.includes('+') ? s : s + 'Z');
+    return d.toLocaleString('es-CO', {
+      timeZone: 'America/Bogota',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false
+    }).replace(',', '');
+  } catch(e) {
+    return utcStr.substring(0, 16);
+  }
 }
 
 // ── Auto refresh ───────────────────────────────────────────────────
@@ -917,7 +1138,7 @@ function tradeRow(t) {
     ? '<span class="pill long">↑ LONG</span>'
     : '<span class="pill short">↓ SHORT</span>';
   return `<tr>
-    <td style="color:var(--muted);font-size:11px">${t.opened_at?.substring(0,16)||'—'}</td>
+    <td style="color:var(--muted);font-size:11px;white-space:nowrap">${toColombiaTime(t.opened_at)}</td>
     <td>${side}</td>
     <td>$${(t.entry_price||0).toLocaleString()}</td>
     <td>${t.exit_price ? '$'+t.exit_price.toLocaleString() : '—'}</td>
@@ -952,22 +1173,45 @@ async function loadTrades() {
   </table>`;
 }
 
-// ── Candlestick chart ──────────────────────────────────────────────
+// ── Candlestick chart + indicadores ───────────────────────────────
+let showSml = false;
+let showEma = false;
+let currentTf = '1h';
+let smlSeries = null;
+let emaSeries = null;
+
+function toggleIndicator(ind) {
+  if (ind === 'sml') {
+    showSml = !showSml;
+    document.getElementById('btn-sml').className = 'ind-btn' + (showSml ? ' active-sml' : '');
+  } else {
+    showEma = !showEma;
+    document.getElementById('btn-ema').className = 'ind-btn' + (showEma ? ' active-ema' : '');
+  }
+  loadChart(currentTf);
+}
+
 async function loadChart(tf, el) {
+  currentTf = tf;
   if (el) {
     document.querySelectorAll('.tf-pill').forEach(p => p.classList.remove('active'));
     el.classList.add('active');
   }
-  const r = await fetch(`/api/candles?interval=${tf}&limit=200`);
-  const d = await r.json();
-  if (!d.ok) return;
+
+  const [rc, ri] = await Promise.all([
+    fetch(`/api/candles?interval=${tf}&limit=300`),
+    fetch(`/api/indicators?interval=${tf}&limit=400`),
+  ]);
+  const [dc, di] = await Promise.all([rc.json(), ri.json()]);
+  if (!dc.ok) return;
 
   const container = document.getElementById('candle-chart');
   container.innerHTML = '';
+  const h = Math.max(280, Math.min(400, window.innerHeight - 260));
 
   const chart = LightweightCharts.createChart(container, {
     width: container.clientWidth,
-    height: 400,
+    height: h,
     layout: { background: { color: '#0f1520' }, textColor: '#c8d8e8' },
     grid: {
       vertLines: { color: '#1a2535' },
@@ -978,28 +1222,56 @@ async function loadChart(tf, el) {
     timeScale: { borderColor: '#1a2535', timeVisible: true },
   });
 
+  // Velas principales
   const series = chart.addCandlestickSeries({
     upColor: '#00e676', downColor: '#ff3d5a',
     borderUpColor: '#00e676', borderDownColor: '#ff3d5a',
     wickUpColor: '#00e676', wickDownColor: '#ff3d5a',
   });
-
-  const candles = d.candles.map(c => ({
+  series.setData(dc.candles.map(c => ({
     time: Math.floor(c.t / 1000),
     open: c.open, high: c.high, low: c.low, close: c.close
-  }));
-  series.setData(candles);
+  })));
 
-  // Markers para trades
-  if (d.markers?.length) {
-    const markers = d.markers
+  // ── SMA Log 144 ──────────────────────────────────────────────
+  smlSeries = null;
+  if (showSml && di.ok && di.sma_log?.length) {
+    smlSeries = chart.addLineSeries({
+      color: '#ffb300', lineWidth: 1.5,
+      priceLineVisible: false, lastValueVisible: true,
+      title: 'SMA Log',
+    });
+    smlSeries.setData(di.sma_log.map(p => ({
+      time: Math.floor(p.t / 1000), value: p.v
+    })));
+  }
+
+  // ── EMA 200 ───────────────────────────────────────────────────
+  emaSeries = null;
+  if (showEma && di.ok && di.ema200?.length) {
+    emaSeries = chart.addLineSeries({
+      color: '#2979ff', lineWidth: 1.5,
+      priceLineVisible: false, lastValueVisible: true,
+      title: 'EMA 200',
+    });
+    emaSeries.setData(di.ema200.map(p => ({
+      time: Math.floor(p.t / 1000), value: p.v
+    })));
+  }
+
+  // ── Markers de trades ─────────────────────────────────────────
+  if (dc.markers?.length) {
+    const markers = dc.markers
       .filter(m => m.price && m.ts)
       .map(m => ({
-        time: Math.floor(new Date(m.ts).getTime() / 1000),
+        time: Math.floor(new Date(
+          m.ts.endsWith('Z') || m.ts.includes('+') ? m.ts : m.ts + 'Z'
+        ).getTime() / 1000),
         position: m.side === 'LONG'
           ? (m.type === 'open' ? 'belowBar' : 'aboveBar')
           : (m.type === 'open' ? 'aboveBar' : 'belowBar'),
-        color: m.type === 'open' ? '#aa66ff' : (m.result === 'WIN' ? '#00e676' : '#ff3d5a'),
+        color: m.type === 'open' ? '#aa66ff'
+             : (m.result === 'WIN' ? '#00e676' : '#ff3d5a'),
         shape: m.type === 'open' ? 'arrowUp' : 'circle',
         text: m.type === 'open'
           ? `${m.side} $${m.price}`
@@ -1007,14 +1279,13 @@ async function loadChart(tf, el) {
         size: 1,
       }))
       .sort((a, b) => a.time - b.time);
-
     if (markers.length) series.setMarkers(markers);
   }
 
   window.addEventListener('resize', () => {
-    chart.resize(container.clientWidth, 400);
+    const newH = Math.max(280, Math.min(400, window.innerHeight - 260));
+    chart.resize(container.clientWidth, newH);
   });
-
   candleChart = chart;
 }
 
@@ -1023,36 +1294,98 @@ async function loadCapital() {
   const r = await fetch('/api/capital');
   const d = await r.json();
   if (!d.ok) return;
+
+  // KPIs de capital
+  const hist = d.history || [];
+  const first = hist.length ? hist[hist.length - 1].balance : 0;
+  const live  = d.balance_live || 0;
+  const pnl   = live - first;
+  const pnlC  = pnl >= 0 ? 'cv' : 'cr';
+  document.getElementById('capital-kpis').innerHTML = `
+    <div class="kpi ${live >= first ? 'bull':'bear'}">
+      <div class="kpi-l">Balance en Binance</div>
+      <div class="kpi-v ${live >= first ? 'cv':'cr'}">$${live.toLocaleString('es-CO',{minimumFractionDigits:2})}</div>
+      <div class="kpi-s">Balance disponible en cuenta</div>
+    </div>
+    <div class="kpi ${pnl >= 0 ? 'bull':'bear'}">
+      <div class="kpi-l">Variación total</div>
+      <div class="kpi-v ${pnlC}">${pnl >= 0?'+':''}$${pnl.toFixed(2)}</div>
+      <div class="kpi-s">Desde primer registro</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-l">Registros</div>
+      <div class="kpi-v cp">${hist.length}</div>
+      <div class="kpi-s">Snapshots históricos</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-l">Movimientos</div>
+      <div class="kpi-v cp">${d.movements?.length || 0}</div>
+      <div class="kpi-s">Depósitos y retiros detectados</div>
+    </div>`;
+
+  // Tabla de movimientos
   const wrap = document.getElementById('movements-wrap');
-  wrap.innerHTML = `<table>
-    <thead><tr><th>Fecha</th><th>Tipo</th><th>Monto</th><th>Saldo después</th><th>Descripción</th></tr></thead>
-    <tbody>${d.movements.map(m => `<tr>
-      <td style="color:var(--muted);font-size:11px">${m.ts?.substring(0,16)}</td>
-      <td><span class="pill ${m.type==='DEPOSIT'?'win':'loss'}">${m.type==='DEPOSIT'?'↑ Ingreso':'↓ Egreso'}</span></td>
-      <td class="${(m.amount||0)>=0?'cv':'cr'}">${(m.amount||0)>=0?'+':''}$${Math.abs(m.amount||0).toFixed(2)}</td>
-      <td>$${(m.balance_after||0).toLocaleString()}</td>
-      <td style="color:var(--muted)">${m.description||'—'}</td>
-    </tr>`).join('')}</tbody>
-  </table>`;
+  if (!d.movements?.length) {
+    wrap.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:12px">Sin movimientos detectados aún. El bot los registra automáticamente al detectar diferencias de balance ≥ $1.</div>';
+  } else {
+    wrap.innerHTML = `<table>
+      <thead><tr><th>Fecha (Col.)</th><th>Tipo</th><th>Monto</th><th>Saldo después</th><th>Descripción</th></tr></thead>
+      <tbody>${d.movements.map(m => `<tr>
+        <td style="color:var(--muted);font-size:11px;white-space:nowrap">${toColombiaTime(m.ts)}</td>
+        <td><span class="pill ${m.type==='DEPOSIT'?'win':'loss'}">${m.type==='DEPOSIT'?'↑ Depósito':'↓ Retiro'}</span></td>
+        <td class="${(m.amount||0)>=0?'cv':'cr'}">${(m.amount||0)>=0?'+':''}$${Math.abs(m.amount||0).toFixed(2)}</td>
+        <td>$${(m.balance_after||0).toLocaleString('es-CO',{minimumFractionDigits:2})}</td>
+        <td style="color:var(--muted);font-size:11px">${m.description||'—'}</td>
+      </tr>`).join('')}</tbody>
+    </table>`;
+  }
+
+  // Gráfico de equity en la pestaña Capital
+  const histRev  = [...hist].reverse();
+  const labels   = histRev.map(h => toColombiaTime(h.ts).substring(0, 10));
+  const values   = histRev.map(h => h.balance);
+  if (window._capChart) window._capChart.destroy();
+  const ctx = document.getElementById('equity-chart-capital');
+  if (ctx) {
+    window._capChart = new Chart(ctx.getContext('2d'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          data: values,
+          borderColor: '#aa66ff',
+          backgroundColor: 'rgba(170,102,255,.1)',
+          fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { display: false }, ticks: { color: '#3d5470', font: { size: 9 }, maxTicksLimit: 8 } },
+          y: { ticks: { color: '#3d5470', font: { size: 10 }, callback: v => '$'+v.toLocaleString() },
+               grid: { color: 'rgba(26,37,53,.6)' } }
+        }
+      }
+    });
+  }
 }
 
-async function submitMovement() {
-  const type   = document.getElementById('mv-type').value;
-  const amount = parseFloat(document.getElementById('mv-amount').value);
-  const desc   = document.getElementById('mv-desc').value;
-  const alert  = document.getElementById('mv-alert');
-  if (!amount || amount <= 0) {
-    alert.innerHTML = '<div class="alert err">Monto inválido</div>'; return;
-  }
-  const r = await fetch('/api/capital/movement', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({type, amount, description: desc})
-  });
+async function takeSnapshot() {
+  const alertEl = document.getElementById('snapshot-alert');
+  alertEl.innerHTML = '<div class="alert ok" style="margin-bottom:0">Consultando Binance...</div>';
+  const r = await fetch('/api/capital/snapshot', { method: 'POST' });
   const d = await r.json();
-  alert.innerHTML = d.ok
-    ? `<div class="alert ok">✓ Registrado. Saldo: $${d.balance_after?.toFixed(2)}</div>`
-    : `<div class="alert err">Error: ${d.error}</div>`;
-  if (d.ok) { loadCapital(); loadSummary(); }
+  if (!d.ok) {
+    alertEl.innerHTML = `<div class="alert err">${d.error}</div>`;
+    return;
+  }
+  const msg = d.movement
+    ? `${d.movement === 'DEPOSIT' ? '↑ Depósito' : '↓ Retiro'} detectado: $${Math.abs(d.diff).toFixed(2)} | Balance: $${d.balance.toFixed(2)}`
+    : `Sin cambios significativos | Balance: $${d.balance.toFixed(2)}`;
+  alertEl.innerHTML = `<div class="alert ok">${msg}</div>`;
+  loadCapital();
+  loadSummary();
 }
 
 // ── Signals ────────────────────────────────────────────────────────
@@ -1061,28 +1394,38 @@ async function loadSignals() {
   const [ds, de] = await Promise.all([rs.json(), re.json()]);
 
   if (ds.ok) {
+    const reasonLabel = (s) => {
+      const r = s.reason_skip || '';
+      if (!r || r === '') return s.executed ? '—' : '<span style="color:var(--muted)">sin razón registrada</span>';
+      if (r.includes('long_only_filter'))  return '<span style="color:var(--bear)">Solo LONG — señal bajista bloqueada</span>';
+      if (r.includes('acp_too_low'))       return '<span style="color:var(--muted)">ACP insuficiente</span>';
+      if (r.includes('macro_filter'))      return '<span style="color:var(--muted)">Precio bajo EMA200</span>';
+      if (r.includes('slope_flat'))        return '<span style="color:var(--muted)">Pendiente plana</span>';
+      if (r.includes('all_filters_passed'))return '<span style="color:var(--bull)">Ejecutada</span>';
+      return `<span style="color:var(--muted);font-size:11px">${r.substring(0,50)}</span>`;
+    };
     document.getElementById('signals-wrap').innerHTML = `<table>
-      <thead><tr><th>Fecha</th><th>Dirección</th><th>Bias Log</th><th>ACP</th><th>Macro</th><th>Ejecutada</th><th>Razón</th></tr></thead>
+      <thead><tr><th>Fecha (Col.)</th><th>Dirección</th><th>Bias Log</th><th>ACP</th><th>Macro</th><th>Ejecutada</th><th>Razón</th></tr></thead>
       <tbody>${ds.signals.map(s => `<tr>
-        <td style="color:var(--muted);font-size:11px">${s.ts?.substring(0,16)}</td>
+        <td style="color:var(--muted);font-size:11px">${toColombiaTime(s.ts)}</td>
         <td>${s.direction===1?'<span class="pill long">↑ LONG</span>':s.direction===-1?'<span class="pill short">↓ SHORT</span>':'<span style="color:var(--muted)">HOLD</span>'}</td>
         <td>${s.log_bias===1?'▲ Alcista':'▼ Bajista'}</td>
         <td>${(s.acp_angle||0).toFixed(4)}°</td>
-        <td>${s.macro_ok?'✓':'✗'}</td>
+        <td>${s.macro_ok?'<span style="color:var(--bull)">✓</span>':'<span style="color:var(--bear)">✗</span>'}</td>
         <td>${s.executed?'<span class="pill win">✓</span>':'<span class="pill loss">✗</span>'}</td>
-        <td style="color:var(--muted);font-size:11px">${s.reason_skip||'—'}</td>
+        <td>${reasonLabel(s)}</td>
       </tr>`).join('')}</tbody>
     </table>`;
   }
 
   if (de.ok) {
     document.getElementById('events-wrap').innerHTML = `<table>
-      <thead><tr><th>Fecha</th><th>Nivel</th><th>Evento</th><th>Detalle</th></tr></thead>
+      <thead><tr><th>Fecha (Col.)</th><th>Nivel</th><th>Evento</th><th>Detalle</th></tr></thead>
       <tbody>${de.events.map(e => `<tr>
-        <td style="color:var(--muted);font-size:11px">${e.ts?.substring(0,16)}</td>
-        <td><span style="color:${e.level==='ERROR'?'var(--bear)':e.level==='WARNING'?'var(--gold)':'var(--muted)'}">${e.level}</span></td>
-        <td>${e.event}</td>
-        <td style="color:var(--muted);font-size:11px">${e.detail||''}</td>
+        <td style="color:var(--muted);font-size:11px;white-space:nowrap">${toColombiaTime(e.ts)}</td>
+        <td><span style="color:${e.level==='ERROR'?'var(--bear)':e.level==='WARNING'?'var(--gold)':'var(--muted)'};font-size:11px">${e.level}</span></td>
+        <td style="font-size:12px">${e.event}</td>
+        <td style="color:var(--muted);font-size:11px;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(e.detail||'').replace(/"/g,"'")}">${e.detail||''}</td>
       </tr>`).join('')}</tbody>
     </table>`;
   }
@@ -1099,6 +1442,7 @@ async function loadConfig() {
   const labels = {
     strategy:'Estrategia', symbol:'Par', leverage:'Apalancamiento',
     risk_pct:'Riesgo por trade (%)', sl_pct:'Stop Loss (%)', tp_pct:'Take Profit (%)',
+    capital_per_trade:'Capital por operación (USDT)',
     acp_threshold:'Umbral ACP (°)', sma_log_period:'Período SMA Log',
     ema_period:'Período EMA', macro_ema:'EMA Macro (filtro)',
     capital_initial:'Capital inicial (USDT)', testnet:'Modo testnet',
@@ -1110,19 +1454,42 @@ async function loadConfig() {
       <td class="cfg-val">${v}</td>
     </tr>`).join('');
 
-  // Prellenar campos editables
   if (cfg.testnet) document.getElementById('cfg-testnet').value = cfg.testnet;
   if (cfg.capital_initial) document.getElementById('cfg-capital').value = cfg.capital_initial;
-  // Telegram (no mostramos token/chat_id por seguridad, solo opciones)
-  if (cfg.telegram_notify_filtered) {
+  if (cfg.capital_per_trade && cfg.capital_per_trade !== '0')
+    document.getElementById('cfg-capital-trade').value = cfg.capital_per_trade;
+  if (cfg.telegram_notify_filtered)
     document.getElementById('tg-filtered').value = cfg.telegram_notify_filtered;
-  }
-  if (cfg.telegram_notify_errors) {
+  if (cfg.telegram_notify_errors)
     document.getElementById('tg-errors').value = cfg.telegram_notify_errors;
-  }
-  if (cfg.telegram_chat_id) {
+  if (cfg.telegram_chat_id)
     document.getElementById('tg-chat-id').value = cfg.telegram_chat_id;
-  }
+}
+
+async function loadCredentialStatus() {
+  const r = await fetch('/api/credentials/status');
+  const d = await r.json();
+  if (!d.ok) return;
+  const c = d.credentials;
+  const srcBadge = (s) => {
+    if (s === 'env')     return '<span style="color:var(--bull);font-weight:600">✓ Env var</span> <span style="color:var(--muted)">(persiste en reinicios)</span>';
+    if (s === 'db')      return '<span style="color:var(--gold);font-weight:600">⚠ Solo BD</span> <span style="color:var(--muted)">(se pierde en redeploy)</span>';
+    return '<span style="color:var(--bear);font-weight:600">✗ No configurada</span>';
+  };
+  const conn = d.binance_connected
+    ? '<span style="color:var(--bull)">✓ Conectado</span>'
+    : '<span style="color:var(--bear)">✗ Sin conexión</span>';
+  document.getElementById('cred-status-wrap').innerHTML = `
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <tr><td style="padding:4px 0;color:var(--muted);width:200px">Binance API Key</td><td>${srcBadge(c.binance_api_key)}</td></tr>
+      <tr><td style="padding:4px 0;color:var(--muted)">Binance Secret</td><td>${srcBadge(c.binance_secret)}</td></tr>
+      <tr><td style="padding:4px 0;color:var(--muted)">Contraseña admin</td><td>${srcBadge(c.admin_password)}</td></tr>
+      <tr><td style="padding:4px 0;color:var(--muted)">Telegram Token</td><td>${srcBadge(c.telegram_token)}</td></tr>
+      <tr><td style="padding:4px 0;color:var(--muted)">Modo testnet</td><td>${srcBadge(c.testnet_mode)}</td></tr>
+      <tr><td style="padding:4px 0;color:var(--muted)">Conexión Binance</td><td>${conn}</td></tr>
+    </table>
+    ${d.warning ? `<div class="alert err" style="margin-top:10px">${d.warning}</div>` : ''}
+  `;
 }
 
 async function saveApiConfig() {
@@ -1131,20 +1498,23 @@ async function saveApiConfig() {
   const secret = document.getElementById('cfg-secret').value.trim();
   const testnet = document.getElementById('cfg-testnet').value;
   const capital = document.getElementById('cfg-capital').value;
+  const capitalTrade = document.getElementById('cfg-capital-trade').value;
   if (key)    data['binance_api_key'] = key;
   if (secret) data['binance_secret']  = secret;
-  data['testnet']          = testnet;
-  data['capital_initial']  = capital;
+  data['testnet']           = testnet;
+  data['capital_initial']   = capital;
+  if (capitalTrade) data['capital_per_trade'] = capitalTrade;
 
   const r = await fetch('/api/config/update', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify(data)
   });
   const d = await r.json();
-  const alert = document.getElementById('api-alert');
-  alert.innerHTML = d.ok
-    ? '<div class="alert ok">✓ Configuración guardada. Conexión Binance verificada.</div>'
+  const alertEl = document.getElementById('api-alert');
+  alertEl.innerHTML = d.ok
+    ? '<div class="alert ok">✓ Configuración guardada. Recargando estado...</div>'
     : `<div class="alert err">Error: ${d.error}</div>`;
+  if (d.ok) { loadCredentialStatus(); loadSummary(); }
 }
 
 async function changePassword() {

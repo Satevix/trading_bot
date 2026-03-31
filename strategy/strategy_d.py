@@ -155,7 +155,7 @@ class StrategyD:
         # ── Filtro de pendiente ───────────────────────────────────
         slope_ok = abs(slope_now) > 0.00001
 
-        # ── Señal final ───────────────────────────────────────────
+        # ── Señal final — SOLO LONG (Strategy D es long-only) ────────
         direction = 0
         reason = "hold"
 
@@ -165,8 +165,17 @@ class StrategyD:
             reason = f"macro_filter (price={'above' if price > e200_now else 'below'} EMA200)"
         elif not slope_ok:
             reason = f"slope_flat ({slope_now:.6f})"
+        elif log_bias == -1:
+            # BLOQUEO CRÍTICO: Strategy D es exclusivamente LONG.
+            # Un bias bajista (cruce descendente SMA_Log) se registra pero NO se ejecuta.
+            reason = "long_only_filter (bias bearish — strategy D no opera SHORT)"
+            log_event("SIGNAL_BLOCKED",
+                      f"Señal SHORT bloqueada — ACP={acp_now:.5f}° bias={log_bias} "
+                      f"price={price:.2f} EMA200={e200_now:.2f} | "
+                      f"Strategy D es LONG-only. Ninguna orden enviada.", "WARNING")
         else:
-            direction = log_bias
+            # log_bias == 1 y todos los filtros pasaron → LONG válido
+            direction = 1
             reason = "all_filters_passed"
 
         result = {
@@ -202,43 +211,78 @@ class StrategyD:
 
     def calculate_order_params(self, direction: int, price: float, balance: float) -> dict:
         """
-        Calcula los parámetros de la orden:
-        - Tamaño de posición
-        - Stop loss (precio)
-        - Take profit (precio)
-        - Precio de liquidación estimado (Binance, margen aislado)
+        Calcula los parámetros de la orden LONG únicamente (Strategy D).
+
+        Lógica de tamaño de posición:
+        - Se usa capital_per_trade (USDT configurado en dashboard) como base.
+        - Si capital_per_trade no está configurado, se usa risk_pct del balance como fallback.
+        - El tamaño notional = capital_per_trade * leverage.
+        - La pérdida máxima real = capital_per_trade * sl_pct * leverage.
+
+        Ejemplo con capital_per_trade=100 USDT, leverage=3, sl=2%:
+          notional = 300 USDT → qty = 300/price BTC
+          pérdida máxima = 100 * 0.02 * 3 = 6 USDT (6% del margen)
         """
-        risk_amount = balance * self.risk_pct
-        sl_distance = price * self.sl_pct
+        import math
 
-        # Tamaño de posición basado en riesgo fijo
-        # (cuánto BTC comprar para que el SL represente el 1% del capital)
-        position_size_usdt = risk_amount / self.sl_pct
-        position_size_usdt = min(position_size_usdt, balance * 0.95)
+        # ── Tamaño de posición ────────────────────────────────────
+        # Prioridad 1: capital_per_trade definido explícitamente
+        capital_per_trade_cfg = get_config("capital_per_trade", "0")
+        capital_per_trade = float(capital_per_trade_cfg)
+
+        if capital_per_trade <= 0:
+            # Fallback: usar risk_pct del balance disponible
+            # risk_pct=1% del balance → capital_per_trade implícito
+            capital_per_trade = balance * self.risk_pct / self.sl_pct
+            log_event("RISK_CALC",
+                      f"capital_per_trade no configurado. "
+                      f"Calculado desde risk_pct: ${capital_per_trade:.2f}", "WARNING")
+
+        # Límite de seguridad: nunca superar el 95% del balance disponible
+        capital_per_trade = min(capital_per_trade, balance * 0.95)
+
+        # Tamaño notional = margen * leverage
+        position_size_usdt = capital_per_trade * self.leverage
         quantity_btc = position_size_usdt / price
-        quantity_btc = round(quantity_btc, 3)  # mínimo 0.001 BTC
+        quantity_btc = round(quantity_btc, 3)  # precisión Binance: 0.001 BTC
 
-        if direction == 1:  # LONG
-            sl_price  = price * (1 - self.sl_pct)
-            tp_price  = price * (1 + self.tp_pct)
-            liq_price = price * (1 - (1/self.leverage - 0.004))
-            # Stop-Limit: límite ligeramente por debajo del stop
-            sl_limit  = sl_price * 0.999
-        else:               # SHORT
-            sl_price  = price * (1 + self.sl_pct)
-            tp_price  = price * (1 - self.tp_pct)
-            liq_price = price * (1 + (1/self.leverage - 0.004))
-            sl_limit  = sl_price * 1.001
+        # ── Precios SL / TP (solo LONG) ──────────────────────────
+        sl_price  = price * (1 - self.sl_pct)
+        tp_price  = price * (1 + self.tp_pct)
+        # Precio de liquidación estimado para margen aislado con leverage L:
+        # liq ≈ entry * (1 - 1/L + maintenance_margin)
+        # maintenance_margin de Binance para BTC ≈ 0.4%
+        liq_price = price * (1 - (1 / self.leverage) + 0.004)
+        # Stop-market no necesita sl_limit, pero lo mantenemos para compatibilidad
+        sl_limit  = sl_price * 0.999
+
+        # ── Pérdida máxima esperada ───────────────────────────────
+        max_loss_usdt = capital_per_trade * self.sl_pct * self.leverage
+        max_loss_pct  = self.sl_pct * self.leverage * 100  # % sobre el margen
+
+        # ── Log detallado de riesgo pre-orden ─────────────────────
+        log_event("RISK_CALC",
+                  f"LONG BTCUSDT | precio={price:.2f} | "
+                  f"capital_margen=${capital_per_trade:.2f} | "
+                  f"leverage={self.leverage}x | notional=${position_size_usdt:.2f} | "
+                  f"qty={quantity_btc:.3f} BTC | "
+                  f"SL={self.sl_pct*100:.1f}% → ${sl_price:.2f} | "
+                  f"TP={self.tp_pct*100:.1f}% → ${tp_price:.2f} | "
+                  f"pérdida_máx=${max_loss_usdt:.2f} ({max_loss_pct:.1f}% del margen) | "
+                  f"balance_disponible=${balance:.2f}")
 
         return {
-            "quantity":        quantity_btc,
-            "position_usdt":   round(position_size_usdt, 2),
-            "sl_price":        round(sl_price, 2),
-            "sl_limit":        round(sl_limit, 2),
-            "tp_price":        round(tp_price, 2),
-            "liq_price":       round(liq_price, 2),
-            "open_fee":        round(position_size_usdt * 0.0004, 4),
-            "margin_required": round(position_size_usdt / self.leverage, 2),
+            "quantity":          quantity_btc,
+            "capital_per_trade": round(capital_per_trade, 2),
+            "position_usdt":     round(position_size_usdt, 2),
+            "sl_price":          round(sl_price, 2),
+            "sl_limit":          round(sl_limit, 2),
+            "tp_price":          round(tp_price, 2),
+            "liq_price":         round(liq_price, 2),
+            "open_fee":          round(position_size_usdt * 0.0004, 4),
+            "margin_required":   round(capital_per_trade, 2),
+            "max_loss_usdt":     round(max_loss_usdt, 2),
+            "max_loss_pct":      round(max_loss_pct, 2),
         }
 
 

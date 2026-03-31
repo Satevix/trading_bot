@@ -288,12 +288,19 @@ def notify_error(event: str, detail: str):
 
 def test_connection() -> bool:
     """
-    Envía un mensaje de prueba para verificar la configuración.
-    Llamado desde el dashboard al guardar las credenciales de Telegram.
+    Envía un mensaje de prueba usando las credenciales almacenadas en BD.
     """
     token   = get_config("telegram_token", "")
     chat_id = get_config("telegram_chat_id", "")
+    return test_connection_direct(token, chat_id)
 
+
+def test_connection_direct(token: str, chat_id: str) -> bool:
+    """
+    Envía un mensaje de prueba con token y chat_id explícitos.
+    Usado desde el dashboard al guardar la configuración, para garantizar
+    que se prueba con los valores recién ingresados y no con los de BD.
+    """
     if not token or not chat_id:
         return False
 
@@ -304,4 +311,13 @@ def test_connection() -> bool:
         f"configuradas correctamente.\n\n"
         f"🕐 {_ts()} · {_mode()}"
     )
-    return _send(msg)
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=8,
+        )
+        return r.status_code == 200
+    except Exception as e:
+        log_event("TELEGRAM_ERROR", f"test_connection_direct: {e}", "WARNING")
+        return False

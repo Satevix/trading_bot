@@ -134,8 +134,9 @@ def init_db():
             "symbol":                     "BTCUSDT",
             "leverage":                   "3",
             "risk_pct":                   "1.0",
-            "sl_pct":                     "1.5",
+            "sl_pct":                     "2.0",
             "tp_pct":                     "3.0",
+            "capital_per_trade":          "0",
             "acp_threshold":              "0.04735",
             "sma_log_period":             "288",
             "ema_period":                 "144",
@@ -156,12 +157,71 @@ def init_db():
                 "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v)
             )
 
-        # Usuario admin por defecto (cambiar en primer login)
-        default_pw = hash_password("satevis2024")
-        conn.execute(
-            "INSERT OR IGNORE INTO users (username, password) VALUES (?, ?)",
-            ("admin", default_pw)
-        )
+        # ── Credenciales desde variables de entorno (prioridad alta) ──
+        # Si están definidas en Render/Railway, se escriben en BD en cada
+        # arranque, sobrescribiendo cualquier valor previo. Esto garantiza
+        # que un redeploy no pierda las credenciales configuradas en el
+        # panel de la plataforma de hosting.
+        #
+        # Variables de entorno soportadas:
+        #   BINANCE_API_KEY    → binance_api_key en BD
+        #   BINANCE_SECRET     → binance_secret en BD
+        #   BINANCE_TESTNET    → testnet en BD ("true" / "false")
+        #   TELEGRAM_TOKEN     → telegram_token en BD
+        #   TELEGRAM_CHAT_ID   → telegram_chat_id en BD
+        env_map = {
+            "BINANCE_API_KEY":  "binance_api_key",
+            "BINANCE_SECRET":   "binance_secret",
+            "BINANCE_TESTNET":  "testnet",
+            "TELEGRAM_TOKEN":   "telegram_token",
+            "TELEGRAM_CHAT_ID": "telegram_chat_id",
+        }
+        env_loaded = []
+        for env_var, db_key in env_map.items():
+            val = os.getenv(env_var, "").strip()
+            if val:
+                conn.execute(
+                    "INSERT OR REPLACE INTO config (key, value, updated) "
+                    "VALUES (?, ?, datetime('now'))",
+                    (db_key, val)
+                )
+                env_loaded.append(env_var)
+
+        if env_loaded:
+            print(f"✅ Credenciales cargadas desde env vars: {', '.join(env_loaded)}")
+
+        # ── Usuario admin ─────────────────────────────────────────
+        # Prioridad: ADMIN_PASSWORD_HASH (env var, hash SHA256 directo)
+        #            > ADMIN_PASSWORD (env var, texto plano — se hashea)
+        #            > "satevis2024" (default hardcoded — solo primera vez)
+        #
+        # Para Render: definir ADMIN_PASSWORD_HASH con el SHA256 de tu contraseña.
+        # Obtenerlo: python3 -c "import hashlib; print(hashlib.sha256(b'tupass').hexdigest())"
+        env_hash = os.getenv("ADMIN_PASSWORD_HASH", "").strip()
+        env_plain = os.getenv("ADMIN_PASSWORD", "").strip()
+
+        if env_hash:
+            # Hash directo desde env var — el más seguro
+            conn.execute(
+                "INSERT OR REPLACE INTO users (username, password) VALUES (?, ?)",
+                ("admin", env_hash)
+            )
+            print("✅ Contraseña admin cargada desde ADMIN_PASSWORD_HASH")
+        elif env_plain:
+            # Contraseña en texto plano desde env var — se hashea al guardar
+            conn.execute(
+                "INSERT OR REPLACE INTO users (username, password) VALUES (?, ?)",
+                ("admin", hash_password(env_plain))
+            )
+            print("✅ Contraseña admin cargada desde ADMIN_PASSWORD")
+        else:
+            # Sin env var → insertar default solo si el usuario no existe aún
+            # (INSERT OR IGNORE preserva la contraseña cambiada en BD)
+            default_pw = hash_password("satevis2024")
+            conn.execute(
+                "INSERT OR IGNORE INTO users (username, password) VALUES (?, ?)",
+                ("admin", default_pw)
+            )
 
     print("✅ Base de datos inicializada")
 

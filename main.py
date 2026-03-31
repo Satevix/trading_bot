@@ -49,11 +49,24 @@ def bot_cycle():
         print(f"[{ts}] ✅ Ciclo completado — acción: {action}")
         log_event("CYCLE_END", str(result))
 
-        # Registrar capital actual periódicamente
+        # Registrar capital actual periódicamente y detectar movimientos
         if action in ("hold", "monitoring", "idle"):
             balance = binance.get_balance()
             if balance > 0:
-                record_capital(balance, "AUTO", "Ciclo periódico")
+                from core.database import get_capital_history, add_capital_movement
+                hist = get_capital_history(1)
+                last_b = float(hist[0]["balance"]) if hist else 0.0
+                diff = round(balance - last_b, 2)
+                if abs(diff) >= 1.0:
+                    mv_type = "DEPOSIT" if diff > 0 else "WITHDRAWAL"
+                    desc = (f"Detectado automáticamente: "
+                            f"{'depósito' if diff > 0 else 'retiro'} de ${abs(diff):.2f}")
+                    add_capital_movement(mv_type, diff, desc, balance)
+                    log_event("CAPITAL_AUTO",
+                              f"{mv_type} ${diff:+.2f} | "
+                              f"anterior=${last_b:.2f} → actual=${balance:.2f}")
+                else:
+                    record_capital(balance, "AUTO", "Ciclo periódico")
 
     except Exception as e:
         print(f"[{ts}] ❌ Error en ciclo: {e}")
