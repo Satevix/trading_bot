@@ -54,23 +54,41 @@ class TradeExecutor:
             result = self._manage_open_position(open_trade_db, live_position, price_now, balance)
             return result
 
-        # ── 5. Sin posición — evaluar nueva señal ─────────────────
+        # ── 5. Sin posición en BD ni en Binance — evaluar señal ──────
         if not open_trade_db and not live_position:
             signal = strategy.get_signal()
             log_event("SIGNAL", str(signal))
 
             if signal["direction"] == 0:
-                # Notificar señal filtrada (solo si está habilitado en config)
                 try:
                     tg.notify_signal_filtered(signal)
                 except Exception:
                     pass
                 return {"action": "hold", "reason": signal["reason"], "signal": signal}
 
-            # Señal válida → ejecutar
+            # Señal LONG válida → notificar decisión antes de ejecutar
+            try:
+                tg.notify_signal_executed(signal, 0)  # trade_id 0 = pendiente
+            except Exception:
+                pass
+
             result = self._open_position(signal, price_now, balance)
             record_capital(binance.get_balance())
             return result
+
+        # ── 6. Posición en Binance sin registro en BD — anomalía ─────
+        if not open_trade_db and live_position:
+            log_event("POSITION_ANOMALY",
+                      f"Posición detectada en Binance sin registro en BD: "
+                      f"{live_position.get('side')} {live_position.get('qty')} BTC "
+                      f"@ ${live_position.get('entry_price')} | "
+                      f"PnL={live_position.get('unrealized_pnl'):.2f} | "
+                      f"Liq=${live_position.get('liquidation_price')}", "WARNING")
+            try:
+                tg.notify_position_anomaly(live_position, balance)
+            except Exception:
+                pass
+            return {"action": "anomaly_detected", "position": live_position}
 
         return {"action": "idle"}
 
@@ -221,7 +239,13 @@ class TradeExecutor:
                   f"sl_ok={verify['sl_active']} tp_ok={verify['tp_active']} | "
                   f"balance_antes=${balance:.2f}")
 
-        # ── Notificación Telegram ─────────────────────────────────
+        # ── Notificación Telegram: señal ejecutada con trade_id real ─
+        try:
+            tg.notify_signal_executed(signal, trade_id)
+        except Exception:
+            pass
+
+        # ── Notificación Telegram: apertura de posición ───────────
         try:
             tg.notify_trade_opened({
                 "side":           "LONG",

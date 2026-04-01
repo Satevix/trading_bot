@@ -65,6 +65,11 @@ def bot_cycle():
                     log_event("CAPITAL_AUTO",
                               f"{mv_type} ${diff:+.2f} | "
                               f"anterior=${last_b:.2f} → actual=${balance:.2f}")
+                    # Notificar cambio de capital por Telegram
+                    try:
+                        tg.notify_capital_change(mv_type, diff, last_b, balance, desc)
+                    except Exception:
+                        pass
                 else:
                     record_capital(balance, "AUTO", "Ciclo periódico")
 

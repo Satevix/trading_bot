@@ -191,44 +191,130 @@ def notify_liquidation(trade: dict):
 
 def notify_signal_filtered(signal: dict):
     """
-    Notifica señales que fueron generadas pero no ejecutadas por los filtros.
-    Solo se envía si telegram_notify_filtered = 'true' en config.
+    Notifica señales evaluadas que NO se ejecutaron.
+    Siempre se envía para señales SHORT bloqueadas (long_only_filter) —
+    es una alerta de seguridad, no verbose opcional.
+    Para el resto, solo se envía si telegram_notify_filtered = 'true'.
     """
-    if get_config("telegram_notify_filtered", "false") != "true":
-        return
-
+    reason    = signal.get("reason", "desconocido")
     direction = signal.get("log_bias", 0)
     acp       = signal.get("acp_angle", 0)
     acp_thr   = float(get_config("acp_threshold", "0.04735"))
-    reason    = signal.get("reason", "desconocido")
     macro_ok  = signal.get("macro_ok", False)
     acp_ok    = signal.get("acp_ok", False)
     slope_ok  = signal.get("slope_ok", False)
 
+    # Señal SHORT bloqueada: siempre notificar — es una irregularidad de seguridad
+    is_blocked_short = "long_only_filter" in reason
+
+    # Para el resto, respetar preferencia del usuario
+    if not is_blocked_short and get_config("telegram_notify_filtered", "false") != "true":
+        return
+
     dir_txt  = "↑ LONG" if direction == 1 else "↓ SHORT"
-    dir_icon = "📗" if direction == 1 else "📕"
+    dir_icon = "📗" if direction == 1 else "🚨"
 
     filters = []
     if not acp_ok:
-        filters.append(f"  ✗ ACP: {acp:.5f}° &lt; {acp_thr}° (umbral)")
+        filters.append(f"  ✗ ACP: {acp:.5f}° &lt; {acp_thr}°")
     else:
         filters.append(f"  ✓ ACP: {acp:.5f}°")
     if not macro_ok:
-        filters.append("  ✗ Filtro macro EMA200: en contra")
+        filters.append("  ✗ Macro EMA200: en contra")
     else:
-        filters.append("  ✓ Filtro macro: OK")
+        filters.append("  ✓ Macro EMA200: OK")
     if not slope_ok:
-        filters.append("  ✗ Pendiente SMA Log: plana")
+        filters.append("  ✗ Pendiente: plana")
     else:
         filters.append("  ✓ Pendiente: OK")
 
+    prefix = "🚨 <b>SATEVIS — SHORT BLOQUEADO</b>" if is_blocked_short else "○ <b>SATEVIS — Señal Filtrada</b>"
+
     msg = (
-        f"○ <b>SATEVIS — Señal Filtrada</b>\n"
+        f"{prefix}\n"
         f"{'─' * 28}\n"
         f"{dir_icon} <b>Dirección:</b> {dir_txt}\n\n"
         f"<b>Filtros:</b>\n"
         f"{chr(10).join(filters)}\n\n"
         f"<i>Razón: {reason}</i>\n\n"
+        f"🕐 {_ts()} · {_mode()}"
+    )
+    _send(msg)
+
+
+def notify_signal_executed(signal: dict, trade_id: int):
+    """
+    Notifica que una señal LONG pasó todos los filtros y se va a ejecutar.
+    Se envía ANTES de abrir la orden, como confirmación de decisión.
+    """
+    acp    = signal.get("acp_angle", 0)
+    price  = signal.get("price", 0)
+    e200   = signal.get("e200_now", 0)
+    sml    = signal.get("sml_now", 0)
+
+    msg = (
+        f"📡 <b>SATEVIS — Señal LONG detectada</b>\n"
+        f"{'─' * 28}\n"
+        f"↑ <b>LONG BTCUSDT</b> · Todos los filtros OK\n\n"
+        f"💵 <b>Precio:</b> ${price:,.2f}\n"
+        f"📐 <b>ACP:</b> {acp:.5f}°\n"
+        f"📊 <b>SMA Log:</b> ${sml:,.2f}\n"
+        f"📈 <b>EMA 200:</b> ${e200:,.2f}\n\n"
+        f"<i>Abriendo posición LONG #{trade_id}...</i>\n\n"
+        f"🕐 {_ts()} · {_mode()}"
+    )
+    _send(msg)
+
+
+def notify_capital_change(type_: str, amount: float,
+                          balance_before: float, balance_after: float,
+                          description: str = ""):
+    """
+    Notifica cambios de capital detectados automáticamente:
+    depósitos, retiros, o diferencias significativas de balance.
+    type_: 'DEPOSIT' | 'WITHDRAWAL'
+    """
+    icon  = "💰" if type_ == "DEPOSIT" else "💸"
+    label = "Depósito detectado" if type_ == "DEPOSIT" else "Retiro detectado"
+    color = "+" if amount > 0 else ""
+
+    msg = (
+        f"{icon} <b>SATEVIS — {label}</b>\n"
+        f"{'─' * 28}\n"
+        f"<b>Movimiento:</b> {color}${amount:,.2f} USDT\n\n"
+        f"📊 <b>Balance anterior:</b> ${balance_before:,.2f}\n"
+        f"📊 <b>Balance actual:</b>   ${balance_after:,.2f}\n"
+        f"{f'<i>{description}</i>' if description else ''}\n\n"
+        f"🕐 {_ts()} · {_mode()}"
+    )
+    _send(msg)
+
+
+def notify_position_anomaly(position: dict, balance: float):
+    """
+    Notifica cuando se detecta una posición abierta en Binance que
+    no está registrada en la BD del bot — puede indicar una operación
+    manual, un error del bot anterior, o una irregularidad.
+    """
+    side  = position.get("side", "?")
+    qty   = position.get("qty", 0)
+    entry = position.get("entry_price", 0)
+    upnl  = position.get("unrealized_pnl", 0)
+    liq   = position.get("liquidation_price", 0)
+
+    msg = (
+        f"⚠️ <b>SATEVIS — Posición no registrada</b>\n"
+        f"{'─' * 28}\n"
+        f"Se detectó una posición en Binance que\n"
+        f"<b>no está registrada</b> en la base de datos del bot.\n\n"
+        f"<b>Posición detectada:</b>\n"
+        f"  · Lado: <b>{side}</b>\n"
+        f"  · Tamaño: {qty} BTC\n"
+        f"  · Entrada: ${entry:,.2f}\n"
+        f"  · PnL no realizado: {'+'if upnl>=0 else ''}${upnl:.2f}\n"
+        f"  · Precio liquidación: ${liq:,.2f}\n\n"
+        f"💰 <b>Balance cuenta:</b> ${balance:,.2f}\n\n"
+        f"⚠️ Verificar y cerrar manualmente si corresponde.\n\n"
         f"🕐 {_ts()} · {_mode()}"
     )
     _send(msg)

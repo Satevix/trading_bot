@@ -206,6 +206,10 @@ def api_capital_snapshot():
         log_event("CAPITAL_AUTO",
                   f"{movement_type} detectado: ${diff:+.2f} | "
                   f"balance_anterior=${last_balance:.2f} → balance_actual=${balance:.2f}")
+        try:
+            tg.notify_capital_change(movement_type, diff, last_balance, balance, desc)
+        except Exception:
+            pass
     else:
         record_capital(balance, "AUTO", "Snapshot periódico")
 
